@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "maxbridge"
+version = "0.1.0"
+description = "MAX Messenger bridge daemon — receive and forward messages via JSON-RPC IPC"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+dependencies = [
+    "websockets>=12.0",
+    "pyyaml>=6.0",
+    "aiohttp>=3.9.0",
+    "cryptography>=41.0",
+    "qrcode>=7.0",
+    "textual>=0.50",
+    "rich>=13.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+    "ruff>=0.1.0",
+]
+
+[project.scripts]
+maxbridge = "maxbridge.main:cli_entry"
+maxbridge-cli = "maxbridge.commander:commander_entry"
+maxbridge-tui = "maxbridge.tui.app:tui_entry"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+maxbridge = ["data/*.yaml"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

@@ -1,0 +1,27 @@
+[Unit]
+Description=maxBridge — MAX Messenger bridge daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/maxbridge -c /etc/maxbridge/config.yaml
+Restart=on-failure
+RestartSec=5
+User=maxbridge
+Group=maxbridge
+RuntimeDirectory=maxbridge
+StateDirectory=maxbridge
+LogsDirectory=maxbridge
+
+# Security hardening
+ProtectSystem=strict
+ProtectHome=read-only
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,50 @@
+"""Named constants for MAX WebSocket protocol opcodes and limits."""
+
+from enum import IntEnum
+
+
+class Opcode(IntEnum):
+    """MAX WebSocket protocol opcodes."""
+    KEEPALIVE = 1
+    HELLO = 6
+    CHANGE_PROFILE = 16
+    START_AUTH = 17
+    CHECK_CODE = 18
+    LOGIN_BY_TOKEN = 19
+    CHANGE_SETTINGS = 22
+    RESOLVE_USERS = 32
+    ADD_CONTACT = 34
+    RESOLVE_CHAT = 48
+    GET_HISTORY = 49
+    READ_MESSAGE = 50
+    CHAT_SETTINGS = 55
+    JOIN_CHANNEL = 57
+    GET_MEMBERS = 59
+    SEND_MESSAGE = 64
+    TYPING = 65
+    DELETE_MESSAGE = 66
+    EDIT_MESSAGE = 67
+    LEAVE_CHAT = 75
+    MANAGE_USERS = 77
+    UPLOAD_PHOTO = 80
+    UPLOAD_VIDEO = 82
+    DOWNLOAD_VIDEO = 83
+    UPLOAD_FILE = 87
+    DOWNLOAD_FILE = 88
+    RESOLVE_BY_LINK = 89
+    INCOMING_MESSAGE = 128
+    UPLOAD_COMPLETE = 136
+    REACT = 178
+    GET_REACTIONS = 181
+
+
+# IPC limits
+MAX_LINE_LENGTH = 65536  # 64 KiB max JSON-RPC line
+MAX_HISTORY_COUNT = 200
+MAX_USER_IDS = 100
+MAX_MESSAGE_LENGTH = 4096  # MAX messenger text limit
+
+MAX_UPLOAD_SIZE = 50 * 1024 * 1024  # 50 MB
+
+# Placeholders
+PHONE_PLACEHOLDER = "+7XXXXXXXXXX"
