@@ -122,7 +122,7 @@ class MaxConnection:
         """Отписаться от канала/чата."""
         return await self.client.invoke_method(
             opcode=Opcode.LEAVE_CHAT,
-            payload={"chatId": chat_id},
+            payload={"chatId": chat_id, "subscribe": False},
         )
 
     async def resolve_users(self, user_ids: list[int]) -> dict[str, Any]:

@@ -73,6 +73,7 @@ class ChatViewScreen(Screen):
         self._names: dict[int, str] = {}
         self._my_id: int = 0
         self._chat_name: str = ""
+        self._can_write: bool = False
 
     def compose(self) -> ComposeResult:
         yield Label(f"  💬 ЧАТ {self._chat_id}", id="chat-header-label")
@@ -85,6 +86,11 @@ class ChatViewScreen(Screen):
             placeholder="✏️ Сообщение... Enter=отправить, ESC=назад",
             id="chat-input")
 
+    def on_mount(self) -> None:
+        # Скрываем поле ввода до определения прав
+        self.query_one("#chat-input", Input).display = False
+        self._load()
+
     def action_go_back(self) -> None:
         self._cleanup()
         self.app.pop_screen()
@@ -95,6 +101,8 @@ class ChatViewScreen(Screen):
             name = self._chat_name or str(self._chat_id)
             self.app.push_screen(
                 ConfirmLeaveScreen(name), self._on_leave_result)
+        elif event.option_id == "rejoin":
+            self._do_rejoin()
 
     def _on_leave_result(self, confirmed: bool) -> None:
         if confirmed:
@@ -108,18 +116,44 @@ class ChatViewScreen(Screen):
         try:
             await self._client.invoke_method(
                 opcode=Opcode.LEAVE_CHAT,
-                payload={"chatId": self._chat_id})
-            self._write_error(
-                f"✅ Вы отписались от '{self._chat_name or self._chat_id}'")
-            await asyncio.sleep(2)
-            self._cleanup()
-            self.app.pop_screen()
+                payload={"chatId": self._chat_id, "subscribe": False})
+            self._write_msg_system(
+                f"✅ Вы отписались от «{self._chat_name or self._chat_id}»")
+            self._set_unsubscribed()
         except Exception as e:
             self._write_error(f"❌ Ошибка отписки: {e}")
 
-    def on_mount(self) -> None:
-        self.query_one("#chat-input", Input).focus()
-        self._load()
+    @work(thread=False)
+    async def _do_rejoin(self) -> None:
+        if not self._client:
+            self._write_error("Нет подключения")
+            return
+        try:
+            await self._client.invoke_method(
+                opcode=Opcode.JOIN_CHANNEL,
+                payload={"chatId": self._chat_id})
+            self._write_msg_system(
+                f"✅ Вы подписались на «{self._chat_name or self._chat_id}»")
+            self._set_subscribed()
+        except Exception as e:
+            self._write_error(f"❌ Ошибка подписки: {e}")
+
+    def _set_unsubscribed(self) -> None:
+        """Переключить UI в режим «отписан»."""
+        self._can_write = False
+        self.query_one("#chat-input", Input).display = False
+        ol = self.query_one("#chat-actions", OptionList)
+        ol.clear_options()
+        ol.add_option(Option(
+            "[bold green]📥 Подписаться снова[/bold green]", id="rejoin"))
+
+    def _set_subscribed(self) -> None:
+        """Переключить UI обратно в режим «подписан»."""
+        ol = self.query_one("#chat-actions", OptionList)
+        ol.clear_options()
+        ol.add_option(Option(
+            "[red]🚪 Отписаться от канала[/red]", id="leave"))
+
 
     async def on_unmount(self) -> None:
         self._cleanup()
@@ -143,6 +177,8 @@ class ChatViewScreen(Screen):
         if not text:
             return
         event.input.value = ""
+        if not self._can_write:
+            return
         if not self._client:
             self._write_error("⏳ Подключение, подождите...")
             return
@@ -220,6 +256,14 @@ class ChatViewScreen(Screen):
         except Exception:
             pass
 
+    def _write_msg_system(self, text: str) -> None:
+        try:
+            log = self.query_one("#chat-log", RichLog)
+            log.write(f"[bold yellow]  ℹ️ {text}[/bold yellow]")
+            log.scroll_end(animate=False)
+        except Exception:
+            pass
+
     @work(thread=False)
     async def _load(self) -> None:
         log = self.query_one("#chat-log", RichLog)
@@ -239,6 +283,16 @@ class ChatViewScreen(Screen):
                 name = chats[0].get("title") or chats[0].get("name") or "DM"
                 ctype = chats[0].get("type", "")
             self._chat_name = name
+            is_channel = ctype == "CHANNEL"
+            self._can_write = not is_channel
+            if self._can_write:
+                inp = self.query_one("#chat-input", Input)
+                inp.display = True
+                inp.focus()
+            # Кнопка отписки только для CHAT (для каналов не работает через WS)
+            if is_channel:
+                ol = self.query_one("#chat-actions", OptionList)
+                ol.clear_options()
             header.update(
                 f"  💬 {name} ({ctype}) [id:{self._chat_id}]  │  ESC=назад")
 
