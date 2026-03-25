@@ -5,8 +5,9 @@ import asyncio
 from textual import on, work
 from textual.app import ComposeResult
 from textual.binding import Binding
-from textual.screen import Screen
-from textual.widgets import Label, OptionList
+from textual.containers import Vertical
+from textual.screen import ModalScreen, Screen
+from textual.widgets import Input, Label, OptionList
 from textual.widgets.option_list import Option
 
 from maxbridge.auth.session import Session
@@ -14,8 +15,85 @@ from maxbridge.cache.entity_cache import _extract_user_name
 from maxbridge.tui.helpers import connect_and_login
 from maxbridge.tui.screens.chat_view import ChatViewScreen
 from maxbridge.tui.styles import CYBERPUNK_CSS
+from maxbridge.utils.constants import Opcode
 
 TEXT_PREVIEW_LEN = 40
+
+
+class JoinChannelScreen(ModalScreen[bool]):
+    """Ввод ссылки для подписки на канал."""
+
+    CSS = CYBERPUNK_CSS + """
+    #join-box {
+        width: 65; height: 8; border: heavy #00ffcc;
+        background: #0d0d1a; padding: 1 2; margin: 5 10;
+    }
+    """
+    BINDINGS = [Binding("escape", "cancel", "Отмена")]
+
+    def __init__(self, client) -> None:
+        super().__init__()
+        self._client = client
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="join-box"):
+            yield Label("[bold cyan]📥 Подписка на канал[/bold cyan]\n")
+            yield Input(
+                placeholder="https://max.ru/join/... или хэш приглашения",
+                id="join-input")
+
+    def on_mount(self) -> None:
+        self.query_one("#join-input", Input).focus()
+
+    @on(Input.Submitted, "#join-input")
+    def _on_submit(self, event: Input.Submitted) -> None:
+        link = event.value.strip()
+        if link:
+            self._do_join(link)
+        else:
+            self.dismiss(False)
+
+    @work(thread=False)
+    async def _do_join(self, link: str) -> None:
+        # Извлекаем хэш из ссылки
+        hash_part = link
+        if "/join/" in link:
+            hash_part = link.split("/join/")[-1].strip("/")
+        elif "max.ru/" in link:
+            hash_part = link.split("max.ru/")[-1].strip("/")
+
+        try:
+            # Резолв по ссылке (opcode 89)
+            resp = await self._client.invoke_method(
+                opcode=Opcode.RESOLVE_BY_LINK,
+                payload={"link": f"join/{hash_part}"})
+            payload = resp.get("payload") or {}
+            if payload.get("error"):
+                self.notify(
+                    f"❌ {payload.get('localizedMessage') or payload['error']}",
+                    severity="error")
+                self.dismiss(False)
+                return
+
+            # Подписка (opcode 57)
+            resp2 = await self._client.invoke_method(
+                opcode=Opcode.JOIN_CHANNEL,
+                payload={"link": f"join/{hash_part}"})
+            p2 = resp2.get("payload") or {}
+            if p2.get("error"):
+                self.notify(
+                    f"❌ {p2.get('localizedMessage') or p2['error']}",
+                    severity="error")
+                self.dismiss(False)
+            else:
+                self.notify("✅ Подписка оформлена!", severity="information")
+                self.dismiss(True)
+        except Exception as e:
+            self.notify(f"❌ Ошибка: {e}", severity="error")
+            self.dismiss(False)
+
+    def action_cancel(self) -> None:
+        self.dismiss(False)
 
 
 class ChatListScreen(Screen):
@@ -60,12 +138,29 @@ class ChatListScreen(Screen):
 
     @on(OptionList.OptionSelected)
     def _on_select(self, event: OptionList.OptionSelected) -> None:
+        if event.option_id == "_join":
+            self._open_join()
+            return
         idx = event.option_index
         if idx < len(self._chat_ids):
             cid = self._chat_ids[idx]
             self._disconnect()
             self.app.push_screen(
                 ChatViewScreen(self._session, cid, self._aid))
+
+    def _open_join(self) -> None:
+        if not self._client:
+            self.notify("❌ Нет подключения", severity="error")
+            return
+
+        def on_result(ok: bool) -> None:
+            if ok:
+                # Перезагружаем список чатов
+                self._disconnect()
+                self._chat_ids.clear()
+                self._load_chats()
+
+        self.app.push_screen(JoinChannelScreen(self._client), on_result)
 
     def _disconnect(self) -> None:
         if self._client:
@@ -88,6 +183,10 @@ class ChatListScreen(Screen):
                 f"         [dim]{last_text}[/dim]",
                 id=str(cid),
             ))
+        # Кнопка подписки внизу
+        ol.add_option(Option(
+            "[bold green]📥 Подписаться на канал[/bold green]",
+            id="_join"))
         if highlighted is not None and highlighted < len(self._chat_ids):
             ol.highlighted = highlighted
 
