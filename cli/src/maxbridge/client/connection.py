@@ -6,6 +6,7 @@ from typing import Any, Callable
 
 from maxbridge.auth.session import Session
 from maxbridge.auth.token_auth import login_with_token
+from maxbridge.protocol.errors import MaxAuthRequiredError
 from maxbridge.protocol.max_client import MaxClient
 from maxbridge.utils.constants import Opcode
 from maxbridge.utils.types import PacketHandler
@@ -25,6 +26,7 @@ class MaxConnection:
         self._packet_callback: PacketHandler | None = None
         self._connected = False
         self._on_fatal_callback: Callable[[], None] | None = None
+        self._on_auth_required_callback: Callable[[Exception], None] | None = None
         self._reconnecting = False
 
     @property
@@ -39,6 +41,9 @@ class MaxConnection:
 
     def set_on_fatal(self, callback: Callable[[], None]) -> None:
         self._on_fatal_callback = callback
+
+    def set_on_auth_required(self, callback: Callable[[Exception], None]) -> None:
+        self._on_auth_required_callback = callback
 
     async def create_raw_client(self) -> MaxClient:
         """Create and connect a raw MaxClient (for initial SMS auth)."""
@@ -57,8 +62,12 @@ class MaxConnection:
         """Create client, connect, authenticate with saved token."""
         self._client = MaxClient()
         await self._client.connect()
-
-        await login_with_token(self._client, self._session)
+        try:
+            await login_with_token(self._client, self._session)
+        except MaxAuthRequiredError as exc:
+            await self._cleanup_failed_client()
+            self._notify_auth_required(exc)
+            raise
         self._connected = True
 
         self._client.set_reconnect_callback(self._on_reconnect)
@@ -82,6 +91,15 @@ class MaxConnection:
             self._client = None
             self._connected = False
             logger.info("Disconnected from MAX")
+
+    async def _cleanup_failed_client(self) -> None:
+        if self._client:
+            try:
+                await self._client.disconnect()
+            except Exception:
+                logger.debug("Disconnect error during auth cleanup", exc_info=True)
+            self._client = None
+        self._connected = False
 
     async def send_message(self, chat_id: int, text: str,
                            **kwargs) -> dict[str, Any]:
@@ -164,10 +182,27 @@ class MaxConnection:
                 self._reconnecting = False
                 logger.info("Reconnected on attempt %d", attempt)
                 return
-            except Exception as e:
-                logger.error("Reconnect attempt %d failed: %s", attempt, e)
+            except MaxAuthRequiredError as exc:
+                try:
+                    await client.disconnect()
+                except Exception:
+                    logger.debug("Disconnect error after auth failure", exc_info=True)
+                self._notify_auth_required(exc)
+                self._reconnecting = False
+                logger.warning("Reconnect stopped: authentication required")
+                return
+            except Exception:
+                logger.exception("Reconnect attempt %d failed", attempt)
 
         self._reconnecting = False
         logger.critical("Failed to reconnect after %d attempts", self._max_retries)
         if self._on_fatal_callback:
             self._on_fatal_callback()
+
+    def _notify_auth_required(self, exc: Exception) -> None:
+        if self._on_auth_required_callback is None:
+            return
+        try:
+            self._on_auth_required_callback(exc)
+        except Exception:
+            logger.exception("Auth-required callback failed")

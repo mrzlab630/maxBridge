@@ -52,6 +52,14 @@ class IpcServer:
         self._authenticated: dict[str, bool] = {}
         self._rate_limiter = RateLimiter(config.get("rate_limits", {}))
 
+    @property
+    def is_running(self) -> bool:
+        return bool(self._server and self._server.is_serving())
+
+    @property
+    def client_count(self) -> int:
+        return len(self._clients)
+
     async def start(self) -> None:
         transport = self._config.get("transport", "unix")
         if transport == "unix":

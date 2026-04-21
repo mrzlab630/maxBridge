@@ -17,6 +17,7 @@ class AccountManager:
         self._encryptor = encryptor
         self._accounts: dict[str, Account] = {}
         self._on_fatal_callback: Callable[[], None] | None = None
+        self._on_auth_required_callback: Callable[[str, Exception], None] | None = None
 
     @property
     def accounts(self) -> dict[str, Account]:
@@ -30,6 +31,15 @@ class AccountManager:
         """Set callback for unrecoverable connection failure on any account."""
         self._on_fatal_callback = callback
 
+    def set_on_auth_required(self,
+                             callback: Callable[[str, Exception], None]) -> None:
+        """Set callback for expired/invalid auth on any account."""
+        self._on_auth_required_callback = callback
+        for account_id, account in self._accounts.items():
+            account.connection.set_on_auth_required(
+                lambda exc, aid=account_id: callback(aid, exc),
+            )
+
     def add_account(self, account_id: str, config: dict[str, Any]) -> Account:
         """Register a new account from config. Does not connect yet."""
         if account_id in self._accounts:
@@ -38,6 +48,10 @@ class AccountManager:
         account = Account(account_id, config, self._encryptor)
         if self._on_fatal_callback:
             account.connection.set_on_fatal(self._on_fatal_callback)
+        if self._on_auth_required_callback:
+            account.connection.set_on_auth_required(
+                lambda exc, aid=account_id: self._on_auth_required_callback(aid, exc),
+            )
 
         self._accounts[account_id] = account
         logger.info("Account '%s' registered", account_id)
@@ -65,8 +79,8 @@ class AccountManager:
             if account.load_session():
                 try:
                     await account.connect()
-                except Exception as e:
-                    logger.error("Failed to connect account '%s': %s", account_id, e)
+                except Exception:
+                    logger.exception("Failed to connect account '%s'", account_id)
             else:
                 logger.warning("Account '%s' has no session — run --auth-only", account_id)
 

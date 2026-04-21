@@ -1,5 +1,6 @@
 """Runtime statistics collector for maxBridge daemon."""
 
+import logging
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -10,6 +11,7 @@ from typing import Any
 class ErrorRecord:
     """Single error event."""
     timestamp: float
+    kind: str
     account_id: str
     method: str
     error: str
@@ -17,6 +19,7 @@ class ErrorRecord:
     def to_dict(self) -> dict[str, Any]:
         return {
             "timestamp": self.timestamp,
+            "kind": self.kind,
             "account_id": self.account_id,
             "method": self.method,
             "error": self.error,
@@ -38,6 +41,12 @@ class StatsCollector:
         # Per-method call counters
         self._rpc_calls: dict[str, int] = {}
         self._rpc_errors: dict[str, int] = {}
+        self._log_errors = 0
+
+        # Delayed attachment reconciliation counters
+        self._attachment_notifications: dict[str, int] = {}
+        self._attachment_reconciled: dict[str, int] = {}
+        self._attachment_unresolved: dict[str, int] = {}
 
         # Error log (ring buffer)
         self._errors: deque[ErrorRecord] = deque(maxlen=max_errors)
@@ -66,8 +75,34 @@ class StatsCollector:
 
     def record_rpc_error(self, method: str, account_id: str, error: str) -> None:
         self._rpc_errors[method] = self._rpc_errors.get(method, 0) + 1
+        self._append_error("rpc", method, account_id, error)
+
+    def record_log_error(self, logger_name: str, error: str,
+                         account_id: str = "") -> None:
+        self._log_errors += 1
+        self._append_error("log", logger_name, account_id, error)
+
+    def record_attachment_notification(self, account_id: str) -> None:
+        self._attachment_notifications[account_id] = (
+            self._attachment_notifications.get(account_id, 0) + 1
+        )
+
+    def record_attachment_reconciled(self, account_id: str) -> None:
+        self._attachment_reconciled[account_id] = (
+            self._attachment_reconciled.get(account_id, 0) + 1
+        )
+
+    def record_attachment_unresolved(self, account_id: str, detail: str) -> None:
+        self._attachment_unresolved[account_id] = (
+            self._attachment_unresolved.get(account_id, 0) + 1
+        )
+        self._append_error("attachment", "reconcile", account_id, detail)
+
+    def _append_error(self, kind: str, method: str,
+                      account_id: str, error: str) -> None:
         self._errors.append(ErrorRecord(
             timestamp=time.time(),
+            kind=kind,
             account_id=account_id,
             method=method,
             error=error,
@@ -101,6 +136,19 @@ class StatsCollector:
                 "errors": dict(self._rpc_errors),
                 "total_calls": sum(self._rpc_calls.values()),
                 "total_errors": sum(self._rpc_errors.values()),
+            },
+            "attachments": {
+                "notifications": dict(self._attachment_notifications),
+                "reconciled": dict(self._attachment_reconciled),
+                "unresolved": dict(self._attachment_unresolved),
+                "total_notifications": sum(self._attachment_notifications.values()),
+                "total_reconciled": sum(self._attachment_reconciled.values()),
+                "total_unresolved": sum(self._attachment_unresolved.values()),
+            },
+            "errors": {
+                "rpc_total": sum(self._rpc_errors.values()),
+                "log_total": self._log_errors,
+                "buffered": len(self._errors),
             },
             "connections": {
                 "ipc_total": self._ipc_connections_total,
@@ -141,3 +189,20 @@ class StatsCollector:
             "error_rate": round(error_rate, 4),
             "recent_errors": len(self._errors),
         }
+
+
+class StatsLogHandler(logging.Handler):
+    """Record runtime log errors into StatsCollector."""
+
+    def __init__(self, stats: StatsCollector,
+                 level: int = logging.ERROR) -> None:
+        super().__init__(level)
+        self._stats = stats
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            rendered = self.format(record)
+        except Exception:
+            self.handleError(record)
+            return
+        self._stats.record_log_error(record.name, rendered)

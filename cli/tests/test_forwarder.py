@@ -1,6 +1,11 @@
 """Тесты Telegram forwarder — форматирование и _esc."""
 
-from maxbridge.telegram.forwarder import TelegramForwarder, _esc
+import logging
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from maxbridge.telegram.forwarder import TelegramForwarder, TelegramLogHandler, _esc
 from maxbridge.utils.types import MessageStatus, UnifiedMessage
 
 
@@ -36,7 +41,6 @@ class TestEscapeHtml:
 class TestFormatMessage:
     def _make_forwarder(self):
         """Создаём forwarder без реальных зависимостей для тестирования формата."""
-        from unittest.mock import MagicMock
         bus = MagicMock()
         bus.has_subscriber.return_value = False
         manager = MagicMock()
@@ -91,6 +95,27 @@ class TestFormatMessage:
         assert "📎" in full
         assert "doc.pdf" in full
 
+    def test_format_full_with_control_action(self):
+        fw = self._make_forwarder()
+        msg = _msg(text="", sender_name="Ирина", chat_name="Настольный теннис", attachments=[
+            {"type": "CONTROL", "data": {"event": "call_start"}}
+        ])
+        full = fw._format_full(msg)
+        assert "Ирина" in full
+        assert "Настольный теннис" in full
+        assert "совершил(а) действие" in full
+        assert "звонок" in full
+        assert "CONTROL" not in full
+
+    def test_format_full_with_unknown_control_action(self):
+        fw = self._make_forwarder()
+        msg = _msg(text="", attachments=[
+            {"type": "CONTROL", "data": {"event": "member_joined"}}
+        ])
+        full = fw._format_full(msg)
+        assert "совершил(а) действие" in full
+        assert "member joined" in full
+
     def test_extract_url_photo(self):
         url = TelegramForwarder._extract_url(
             "PHOTO", {"baseUrl": "https://example.com/photo"})
@@ -124,3 +149,68 @@ class TestFormatMessage:
         ])
         media = fw._find_media(msg)
         assert media is None
+
+    def test_format_alert(self):
+        alert = TelegramForwarder._format_alert(
+            "Ошибка <MAX>", "token expired & session invalid"
+        )
+        assert "<b>Ошибка &lt;MAX&gt;</b>" in alert
+        assert "<pre>token expired &amp; session invalid</pre>" in alert
+
+
+class TestErrorNotifications:
+    def _make_forwarder(self):
+        bus = MagicMock()
+        bus.has_subscriber.return_value = False
+        manager = MagicMock()
+        manager.account_ids = ["default"]
+        return TelegramForwarder(bus, manager)
+
+    def test_log_handler_forwards_error_record(self):
+        fw = self._make_forwarder()
+        fw.send_alert_nowait = MagicMock()
+        handler = TelegramLogHandler(fw)
+        record = logging.LogRecord(
+            name="maxbridge.client.connection",
+            level=logging.ERROR,
+            pathname=__file__,
+            lineno=1,
+            msg="token expired",
+            args=(),
+            exc_info=None,
+        )
+
+        handler.emit(record)
+
+        fw.send_alert_nowait.assert_called_once_with("token expired")
+
+    def test_log_handler_ignores_forwarder_logs(self):
+        fw = self._make_forwarder()
+        fw.send_alert_nowait = MagicMock()
+        handler = TelegramLogHandler(fw)
+        record = logging.LogRecord(
+            name="maxbridge.telegram.forwarder",
+            level=logging.ERROR,
+            pathname=__file__,
+            lineno=1,
+            msg="telegram send failed",
+            args=(),
+            exc_info=None,
+        )
+
+        handler.emit(record)
+
+        fw.send_alert_nowait.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_send_alert_uses_send_text(self):
+        fw = self._make_forwarder()
+        fw._config = MagicMock(enabled=True, bot_token="token", chat_id="chat")
+        fw._http = MagicMock()
+        fw._send_text = AsyncMock(return_value=True)
+
+        result = await fw.send_alert("fatal startup error")
+
+        assert result is True
+        fw._send_text.assert_called_once()
+        assert "fatal startup error" in fw._send_text.call_args[0][0]

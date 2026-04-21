@@ -1,0 +1,18 @@
+[Unit]
+Description=PM2 process manager for maxBridge
+Documentation=https://pm2.keymetrics.io/
+After=network.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment=PATH=/home/yokinaboy/.nvm/versions/node/v24.13.0/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=PM2_HOME=/home/yokinaboy/.pm2
+Restart=on-failure
+RestartSec=5
+ExecStart=/home/yokinaboy/.nvm/versions/node/v24.13.0/bin/pm2 resurrect
+ExecReload=/home/yokinaboy/.nvm/versions/node/v24.13.0/bin/pm2 reload all
+ExecStop=/home/yokinaboy/.nvm/versions/node/v24.13.0/bin/pm2 kill
+
+[Install]
+WantedBy=default.target

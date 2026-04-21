@@ -1,5 +1,6 @@
 """Пересылка сообщений MAX → Telegram через Bot API."""
 
+import asyncio
 import logging
 
 import aiohttp
@@ -16,6 +17,26 @@ _SUB_ID = "telegram_forwarder"
 _FILE_LIMIT = 50 * 1024 * 1024
 _MAX_CAPTION = 1024
 _MAX_TEXT = 4096
+_MAX_ALERT_BODY = 3800
+
+
+class TelegramLogHandler(logging.Handler):
+    """Forward maxBridge errors to Telegram without looping on self-errors."""
+
+    def __init__(self, forwarder: "TelegramForwarder",
+                 level: int = logging.ERROR) -> None:
+        super().__init__(level)
+        self._forwarder = forwarder
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if record.name.startswith("maxbridge.telegram.forwarder"):
+            return
+        try:
+            rendered = self.format(record)
+        except Exception:
+            self.handleError(record)
+            return
+        self._forwarder.send_alert_nowait(rendered)
 
 
 class TelegramForwarder:
@@ -27,10 +48,12 @@ class TelegramForwarder:
         self._manager = account_manager
         self._config: TelegramConfig | None = None
         self._http: aiohttp.ClientSession | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
         self._multi = len(account_manager.account_ids) > 1
 
     async def start(self) -> None:
         self._config = load_telegram_config()
+        self._loop = asyncio.get_running_loop()
         if not self._config or not self._config.enabled:
             logger.info("Telegram оповещения отключены")
             return
@@ -49,10 +72,20 @@ class TelegramForwarder:
         if self._http and not self._http.closed:
             await self._http.close()
             self._http = None
+        self._loop = None
 
     async def reload(self) -> None:
         await self.stop()
         await self.start()
+
+    @property
+    def is_ready(self) -> bool:
+        return bool(self._config and self._http and self._loop)
+
+    def make_log_handler(self, fmt: str) -> logging.Handler:
+        handler = TelegramLogHandler(self)
+        handler.setFormatter(logging.Formatter(fmt))
+        return handler
 
     async def _on_message(self, msg: UnifiedMessage) -> None:
         if not self._config or not self._http:
@@ -72,6 +105,22 @@ class TelegramForwarder:
         text = self._format_full(msg)
         await self._send_text(text)
 
+    async def send_alert(self, text: str, title: str = "Ошибка maxBridge") -> bool:
+        """Отправить системное уведомление в Telegram."""
+        if not self._config or not self._http:
+            return False
+        return await self._send_text(self._format_alert(title, text))
+
+    def send_alert_nowait(self, text: str, title: str = "Ошибка maxBridge") -> None:
+        """Поставить отправку уведомления в event loop, если Telegram уже поднят."""
+        if not self.is_ready or not self._loop or self._loop.is_closed():
+            return
+
+        def _schedule() -> None:
+            asyncio.create_task(self.send_alert(text, title=title))
+
+        self._loop.call_soon_threadsafe(_schedule)
+
     # ── Форматирование ──────────────────────────────────
 
     def _format_header(self, msg: UnifiedMessage) -> str:
@@ -88,6 +137,10 @@ class TelegramForwarder:
 
     def _format_full(self, msg: UnifiedMessage) -> str:
         """Полное сообщение с текстом и описанием вложений."""
+        control_text = self._format_control_message(msg)
+        if control_text:
+            return control_text[:_MAX_TEXT]
+
         parts = [self._format_header(msg), "\n"]
         if msg.text:
             parts.append(_esc(msg.text))
@@ -106,6 +159,33 @@ class TelegramForwarder:
                 name = data.get("fileName") or data.get("name") or atype
                 parts.append(f"\n📎 {_esc(name)}")
         return "".join(parts)[:_MAX_TEXT]
+
+    def _format_control_message(self, msg: UnifiedMessage) -> str | None:
+        """Readable fallback for service actions like join/call/pin."""
+        if msg.text.strip():
+            return None
+        if not msg.attachments:
+            return None
+        if any(a.get("type") != "CONTROL" for a in msg.attachments):
+            return None
+
+        sender = _esc(msg.sender_name or str(msg.sender_id or "Пользователь"))
+        chat = _esc(msg.chat_name or str(msg.chat_id))
+        events = []
+        for attach in msg.attachments:
+            data = attach.get("data", {})
+            event = data.get("event")
+            if event:
+                events.append(_humanize_control_event(str(event)))
+
+        if not events:
+            events = ["системное действие"]
+
+        action_text = ", ".join(events)
+        parts = [f"<b>{sender}</b> совершил(а) действие в <b>{chat}</b>: { _esc(action_text) }"]
+        if self._multi:
+            parts.append(f" [{_esc(msg.account_id)}]")
+        return "".join(parts)
 
     def _find_media(self, msg: UnifiedMessage) -> dict | None:
         """Найти первое пересылаемое вложение."""
@@ -130,6 +210,13 @@ class TelegramForwarder:
             return data.get("thumbnail") or ""
         # AUDIO и FILE url привязаны к srcIp — не работают
         return ""
+
+    @staticmethod
+    def _format_alert(title: str, text: str) -> str:
+        """Подготовить системное уведомление об ошибке."""
+        header = f"⚠️ <b>{_esc(title)}</b>"
+        body = (_esc(text).strip() or "Unknown error")[:_MAX_ALERT_BODY]
+        return f"{header}\n<pre>{body}</pre>"
 
     # ── Отправка медиа ──────────────────────────────────
 
@@ -211,9 +298,9 @@ class TelegramForwarder:
 
     # ── Отправка текста ─────────────────────────────────
 
-    async def _send_text(self, text: str) -> None:
+    async def _send_text(self, text: str) -> bool:
         if not self._config or not self._http:
-            return
+            return False
         api = _API.format(token=self._config.bot_token,
                           method="sendMessage")
         payload = {
@@ -228,8 +315,11 @@ class TelegramForwarder:
                     body = await resp.text()
                     logger.warning("Telegram sendMessage: %s %s",
                                    resp.status, body[:100])
+                    return False
+            return True
         except Exception:
             logger.debug("Ошибка Telegram sendMessage", exc_info=True)
+            return False
 
 
 def _esc(text: str) -> str:
@@ -237,3 +327,27 @@ def _esc(text: str) -> str:
             .replace("&", "&amp;")
             .replace("<", "&lt;")
             .replace(">", "&gt;"))
+
+
+def _humanize_control_event(event: str) -> str:
+    known = {
+        "new": "создание чата",
+        "join": "вступление",
+        "add": "добавление участника",
+        "invite": "приглашение участника",
+        "remove": "удаление участника",
+        "leave": "выход из чата",
+        "call": "звонок",
+        "call_start": "звонок",
+        "video_chat_start": "звонок",
+        "pin": "закрепление сообщения",
+        "pin_message": "закрепление сообщения",
+        "unpin": "открепление сообщения",
+        "title_change": "смена названия",
+        "description_change": "смена описания",
+        "icon_change": "смена аватара",
+    }
+    normalized = event.strip().lower()
+    if normalized in known:
+        return known[normalized]
+    return normalized.replace("-", " ").replace("_", " ")

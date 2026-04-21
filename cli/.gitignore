@@ -35,6 +35,8 @@ data/
 max_session.txt
 .idea/
 .vscode/
+.codex
+.playwright-mcp/
 *.swp
 *.swo
 *~

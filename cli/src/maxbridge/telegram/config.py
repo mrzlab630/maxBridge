@@ -16,6 +16,7 @@ class TelegramConfig:
     enabled: bool = False
     bot_token: str = ""
     chat_id: str = ""
+    allowed_chat_ids: list[str] | None = None
 
 
 def load_telegram_config(path: str = _CONFIG_PATH) -> TelegramConfig:
@@ -29,6 +30,7 @@ def load_telegram_config(path: str = _CONFIG_PATH) -> TelegramConfig:
             enabled=bool(data.get("enabled", False)),
             bot_token=str(data.get("bot_token", "")),
             chat_id=str(data.get("chat_id", "")),
+            allowed_chat_ids=_load_allowed_chat_ids(data),
         )
     except (json.JSONDecodeError, OSError) as e:
         logger.warning("Ошибка чтения telegram конфига: %s", e)
@@ -46,3 +48,14 @@ def save_telegram_config(config: TelegramConfig,
             asdict(config), ensure_ascii=False, indent=2).encode())
     finally:
         os.close(fd)
+
+
+def _load_allowed_chat_ids(data: dict) -> list[str]:
+    raw = data.get("allowed_chat_ids")
+    if isinstance(raw, list):
+        values = [str(item) for item in raw if str(item)]
+        if values:
+            return values
+
+    chat_id = str(data.get("chat_id", ""))
+    return [chat_id] if chat_id else []

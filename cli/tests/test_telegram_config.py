@@ -15,17 +15,23 @@ class TestTelegramConfig:
         assert cfg.enabled is False
         assert cfg.bot_token == ""
         assert cfg.chat_id == ""
+        assert cfg.allowed_chat_ids is None
 
     def test_save_and_load(self, tmp_dir):
         path = os.path.join(tmp_dir, "tg.json")
         cfg = TelegramConfig(
-            enabled=True, bot_token="123:ABC", chat_id="-100123")
+            enabled=True,
+            bot_token="123:ABC",
+            chat_id="-100123",
+            allowed_chat_ids=["-100123", "145"],
+        )
         save_telegram_config(cfg, path)
 
         loaded = load_telegram_config(path)
         assert loaded.enabled is True
         assert loaded.bot_token == "123:ABC"
         assert loaded.chat_id == "-100123"
+        assert loaded.allowed_chat_ids == ["-100123", "145"]
 
     def test_file_permissions(self, tmp_dir):
         path = os.path.join(tmp_dir, "tg.json")
@@ -50,3 +56,11 @@ class TestTelegramConfig:
         cfg = load_telegram_config(path)
         assert cfg.enabled is True
         assert cfg.bot_token == ""
+        assert cfg.allowed_chat_ids == []
+
+    def test_chat_id_used_as_default_allowed_chat(self, tmp_dir):
+        path = os.path.join(tmp_dir, "single-chat.json")
+        with open(path, "w") as f:
+            f.write('{"enabled": true, "chat_id": "-100123"}')
+        cfg = load_telegram_config(path)
+        assert cfg.allowed_chat_ids == ["-100123"]

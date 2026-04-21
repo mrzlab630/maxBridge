@@ -15,11 +15,13 @@ from maxbridge.cache.entity_cache import EntityCache
 from maxbridge.client.account_manager import AccountManager
 from maxbridge.client.event_router import EventRouter
 from maxbridge.config import get_nested, load_config
+from maxbridge.handlers.attachment import create_upload_complete_handler
 from maxbridge.handlers.message import create_message_handler
 from maxbridge.ipc.methods import RpcMethods
 from maxbridge.ipc.server import IpcServer
-from maxbridge.ipc.stats import StatsCollector
+from maxbridge.ipc.stats import StatsCollector, StatsLogHandler
 from maxbridge.protocol.errors import MaxApiError, MaxConnectionError
+from maxbridge.telegram.control_bot import TelegramControlBot
 from maxbridge.telegram.forwarder import TelegramForwarder
 from maxbridge.utils.constants import Opcode
 from maxbridge.utils.logger import setup_logging
@@ -34,6 +36,8 @@ class MaxBridgeDaemon:
         self._config = config
         self._shutdown_event = asyncio.Event()
         self._pid_fd: int | None = None
+        self._telegram_error_handler: logging.Handler | None = None
+        self._stats_error_handler: logging.Handler | None = None
 
         key_path = get_nested(config, "security.key_file", "data/master.key")
         self._encryptor = TokenEncryptor(key_path)
@@ -56,6 +60,9 @@ class MaxBridgeDaemon:
             stats=self._stats,
         )
         self._telegram = TelegramForwarder(self._event_bus, self._manager)
+        self._control_bot = TelegramControlBot(self._manager, self._stats)
+        self._control_bot.set_status_provider(self._runtime_status)
+        self._manager.set_on_auth_required(self._control_bot.request_auth_nowait)
         self._register_accounts(config)
 
     def _register_accounts(self, config: dict) -> None:
@@ -71,6 +78,9 @@ class MaxBridgeDaemon:
         logger.info("maxBridge v%s starting (%d accounts)...",
                      __version__, len(self._manager.account_ids))
         self._write_pid()
+        await self._telegram.start()
+        await self._control_bot.start()
+        self._attach_error_notifications()
 
         listen_chats = get_nested(self._config, "bridge.listen_chats", "all")
         for account_id in self._manager.account_ids:
@@ -83,26 +93,39 @@ class MaxBridgeDaemon:
                 stats=self._stats,
                 entity_cache=self._entity_cache,
             )
+            attachment_handler = create_upload_complete_handler(
+                self._event_bus,
+                connection=account.connection,
+                account_id=account_id,
+                listen_chats=listen_chats,
+                stats=self._stats,
+                entity_cache=self._entity_cache,
+            )
             self._router.on_opcode(Opcode.INCOMING_MESSAGE, handler)
+            self._router.on_opcode(Opcode.UPLOAD_COMPLETE, attachment_handler)
 
         self._manager.set_packet_callback(self._router.dispatch)
         await self._manager.connect_all()
         await self._ipc_server.start()
-        await self._telegram.start()
 
         logger.info("maxBridge is running. Waiting for messages...")
         await self._shutdown_event.wait()
 
     async def stop(self) -> None:
         logger.info("Shutting down maxBridge...")
+        await self._control_bot.stop()
         await self._telegram.stop()
         await self._ipc_server.stop()
         await self._manager.disconnect_all()
         self._remove_pid()
+        self._detach_error_notifications()
         logger.info("maxBridge stopped.")
 
     async def authenticate(self, account_id: str | None = None) -> None:
         """Authenticate accounts. Uses QR code (primary) or SMS (fallback)."""
+        await self._telegram.start()
+        await self._control_bot.start()
+        self._attach_error_notifications()
         targets = self._get_auth_targets(account_id)
         for aid in targets:
             account = self._manager.require(aid)
@@ -159,6 +182,51 @@ class MaxBridgeDaemon:
     def request_shutdown(self) -> None:
         self._shutdown_event.set()
 
+    def _attach_error_notifications(self) -> None:
+        if self._telegram_error_handler is not None or self._stats_error_handler is not None:
+            return
+
+        root = logging.getLogger("maxbridge")
+        fmt = get_nested(
+            self._config,
+            "logging.format",
+            "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        )
+        if self._telegram.is_ready:
+            self._telegram_error_handler = self._telegram.make_log_handler(fmt)
+            root.addHandler(self._telegram_error_handler)
+
+        self._stats_error_handler = StatsLogHandler(self._stats)
+        self._stats_error_handler.setFormatter(logging.Formatter(fmt))
+        root.addHandler(self._stats_error_handler)
+
+    def _detach_error_notifications(self) -> None:
+        root = logging.getLogger("maxbridge")
+        if self._telegram_error_handler is not None:
+            root.removeHandler(self._telegram_error_handler)
+            self._telegram_error_handler = None
+        if self._stats_error_handler is not None:
+            root.removeHandler(self._stats_error_handler)
+            self._stats_error_handler = None
+
+    def _runtime_status(self) -> dict[str, dict[str, object]]:
+        return {
+            "daemon": {
+                "running": True,
+                "shutdown_requested": self._shutdown_event.is_set(),
+            },
+            "telegram": {
+                "control_bot_ready": self._control_bot.is_ready,
+                "forwarder_ready": self._telegram.is_ready,
+                "alerts_enabled": self._telegram_error_handler is not None,
+            },
+            "bridge": {
+                "ipc_running": self._ipc_server.is_running,
+                "ipc_clients": self._ipc_server.client_count,
+                "subscribers": self._event_bus.subscriber_count,
+            },
+        }
+
 
 def cli_entry() -> None:
     parser = argparse.ArgumentParser(
@@ -191,6 +259,17 @@ def cli_entry() -> None:
     daemon = MaxBridgeDaemon(config)
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
+
+    def _handle_loop_exception(_loop: asyncio.AbstractEventLoop,
+                               context: dict) -> None:
+        exc = context.get("exception")
+        msg = context.get("message", "Unhandled asyncio exception")
+        if exc is not None:
+            logger.error(msg, exc_info=exc)
+        else:
+            logger.error(msg)
+
+    loop.set_exception_handler(_handle_loop_exception)
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, daemon.request_shutdown)
     try:
@@ -202,8 +281,13 @@ def cli_entry() -> None:
     except KeyboardInterrupt:
         pass
     except (MaxApiError, MaxConnectionError) as e:
+        logger.exception("MAX connection/auth error")
         print(f"\n[ERROR] {e}")
     except RuntimeError as e:
+        logger.exception("Runtime error in maxBridge")
+        print(f"\n[ERROR] {e}")
+    except Exception as e:
+        logger.exception("Unhandled maxBridge error")
         print(f"\n[ERROR] {e}")
     finally:
         loop.run_until_complete(daemon.stop())

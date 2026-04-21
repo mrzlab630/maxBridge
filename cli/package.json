@@ -1,0 +1,12 @@
+{
+  "name": "maxbridge-cli",
+  "private": true,
+  "scripts": {
+    "pm2:prod": "pm2 start ecosystem.config.cjs --only maxbridge",
+    "pm2:restart": "pm2 restart ecosystem.config.cjs --only maxbridge",
+    "pm2:status": "pm2 status maxbridge",
+    "pm2:logs": "pm2 logs maxbridge --lines 100",
+    "pm2:delete": "pm2 delete maxbridge",
+    "pm2:save": "pm2 save"
+  }
+}

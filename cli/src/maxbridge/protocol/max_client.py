@@ -13,20 +13,35 @@ from typing import Any, Callable, Coroutine
 
 import websockets
 
-from maxbridge.protocol.errors import MaxApiError, MaxConnectionError, raise_for_payload
+from maxbridge.config import load_config
+from maxbridge.protocol.errors import (
+    MaxApiError,
+    MaxConnectionError,
+    MaxPasswordChallengeRequired,
+    raise_for_payload,
+)
 
 logger = logging.getLogger("maxbridge.protocol.max_client")
 
-WS_HOST = "wss://ws-api.oneme.ru/websocket"
-WS_ORIGIN = "https://web.max.ru"
-WS_USER_AGENT = (
+DEFAULT_WS_HOST = "wss://ws-api.oneme.ru/websocket"
+DEFAULT_WS_ORIGIN = "https://web.max.ru"
+DEFAULT_WS_USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
-RPC_VERSION = 11
-APP_VERSION = "26.2.2"
-KEEPALIVE_INTERVAL = 30
-KEEPALIVE_TIMEOUT = 15
+DEFAULT_RPC_VERSION = 11
+DEFAULT_APP_VERSION = "26.2.2"
+DEFAULT_KEEPALIVE_INTERVAL = 30
+DEFAULT_KEEPALIVE_TIMEOUT = 15
+DEFAULT_HELLO = {
+    "device_type": "WEB",
+    "locale": "ru_RU",
+    "device_locale": "ru-RU",
+    "os_version": "Linux",
+    "device_name": "maxBridge",
+    "screen": "1920x1080 1.0x",
+    "timezone": "Europe/Moscow",
+}
 
 PacketCallback = Callable[["MaxClient", dict[str, Any]], Coroutine[Any, Any, None]]
 ReconnectCallback = Callable[[], Coroutine[Any, Any, None]]
@@ -35,7 +50,34 @@ ReconnectCallback = Callable[[], Coroutine[Any, Any, None]]
 class MaxClient:
     """Async MAX messenger WebSocket client."""
 
-    def __init__(self) -> None:
+    def __init__(self, config: dict[str, Any] | None = None) -> None:
+        client_cfg = (config or load_config()).get("max_client", {})
+        hello_cfg = client_cfg.get("hello", {})
+
+        self._ws_host = client_cfg.get("ws_host", DEFAULT_WS_HOST)
+        self._ws_origin = client_cfg.get("ws_origin", DEFAULT_WS_ORIGIN)
+        self._ws_user_agent = client_cfg.get("user_agent", DEFAULT_WS_USER_AGENT)
+        self._rpc_version = int(client_cfg.get("rpc_version", DEFAULT_RPC_VERSION))
+        self._app_version = client_cfg.get("app_version", DEFAULT_APP_VERSION)
+        self._keepalive_interval = int(
+            client_cfg.get("keepalive_interval", DEFAULT_KEEPALIVE_INTERVAL),
+        )
+        self._keepalive_timeout = int(
+            client_cfg.get("keepalive_timeout", DEFAULT_KEEPALIVE_TIMEOUT),
+        )
+        self._hello = {
+            "deviceType": hello_cfg.get("device_type", DEFAULT_HELLO["device_type"]),
+            "locale": hello_cfg.get("locale", DEFAULT_HELLO["locale"]),
+            "osVersion": hello_cfg.get("os_version", DEFAULT_HELLO["os_version"]),
+            "deviceName": hello_cfg.get("device_name", DEFAULT_HELLO["device_name"]),
+            "headerUserAgent": self._ws_user_agent,
+            "deviceLocale": hello_cfg.get(
+                "device_locale", DEFAULT_HELLO["device_locale"],
+            ),
+            "appVersion": self._app_version,
+            "screen": hello_cfg.get("screen", DEFAULT_HELLO["screen"]),
+            "timezone": hello_cfg.get("timezone", DEFAULT_HELLO["timezone"]),
+        }
         self._connection = None
         self._seq = itertools.count(1)
         self._pending: dict[int, asyncio.Future] = {}
@@ -62,14 +104,14 @@ class MaxClient:
             raise RuntimeError("Already connected")
 
         self._connection = await websockets.connect(
-            WS_HOST,
+            self._ws_host,
             additional_headers={
-                "Origin": WS_ORIGIN,
-                "User-Agent": WS_USER_AGENT,
+                "Origin": self._ws_origin,
+                "User-Agent": self._ws_user_agent,
             },
         )
         self._recv_task = asyncio.create_task(self._recv_loop())
-        logger.debug("Connected to %s", WS_HOST)
+        logger.debug("Connected to %s", self._ws_host)
 
     async def disconnect(self) -> None:
         """Gracefully close everything."""
@@ -110,7 +152,7 @@ class MaxClient:
 
         seq = next(self._seq)
         request = {
-            "ver": RPC_VERSION,
+            "ver": self._rpc_version,
             "cmd": 0,
             "seq": seq,
             "opcode": opcode,
@@ -142,17 +184,7 @@ class MaxClient:
         response = await self.invoke_method(
             opcode=6,
             payload={
-                "userAgent": {
-                    "deviceType": "WEB",
-                    "locale": "ru_RU",
-                    "osVersion": "Linux",
-                    "deviceName": "maxBridge",
-                    "headerUserAgent": WS_USER_AGENT,
-                    "deviceLocale": "ru-RU",
-                    "appVersion": APP_VERSION,
-                    "screen": "1920x1080 1.0x",
-                    "timezone": "Europe/Moscow",
-                },
+                "userAgent": dict(self._hello),
                 "deviceId": self._device_id,
             },
         )
@@ -235,6 +267,9 @@ class MaxClient:
     def extract_login_token(self, auth_response: dict[str, Any]) -> str:
         """Extract the persistent login token from SMS verify / token login response."""
         payload = auth_response.get("payload", {})
+        password_challenge = payload.get("passwordChallenge")
+        if isinstance(password_challenge, dict):
+            raise MaxPasswordChallengeRequired(password_challenge)
 
         # Path 1: tokenAttrs.LOGIN.token
         token_attrs = payload.get("tokenAttrs", {})
@@ -251,6 +286,13 @@ class MaxClient:
         raise RuntimeError(
             f"Cannot extract login token. Keys: {list(payload.keys())}"
         )
+
+    def extract_password_challenge(self,
+                                   auth_response: dict[str, Any]) -> dict[str, Any] | None:
+        """Return password challenge payload if MAX requires second factor."""
+        payload = auth_response.get("payload", {})
+        challenge = payload.get("passwordChallenge")
+        return challenge if isinstance(challenge, dict) else None
 
     # ── QR Auth ─────────────────────────────────────────────
 
@@ -280,6 +322,18 @@ class MaxClient:
         self._start_keepalive()
         return response
 
+    async def check_password(self, track_id: str, password: str) -> dict[str, Any]:
+        """Complete second-factor password challenge and return auth response."""
+        response = await self.invoke_method(
+            opcode=115,
+            payload={"trackId": track_id, "password": password},
+        )
+        payload = response.get("payload", {})
+        raise_for_payload(payload, context="Password challenge")
+        self._is_logged_in = True
+        self._start_keepalive()
+        return response
+
     # ── Keepalive ───────────────────────────────────────────
 
     def _start_keepalive(self) -> None:
@@ -294,7 +348,7 @@ class MaxClient:
                 try:
                     await asyncio.wait_for(
                         self.invoke_method(1, {"interactive": False}),
-                        timeout=KEEPALIVE_TIMEOUT,
+                        timeout=self._keepalive_timeout,
                     )
                 except asyncio.TimeoutError:
                     logger.warning("Keepalive timeout")
@@ -304,7 +358,7 @@ class MaxClient:
                 except Exception as e:
                     logger.warning("Keepalive error: %s", e)
                     break
-                await asyncio.sleep(KEEPALIVE_INTERVAL)
+                await asyncio.sleep(self._keepalive_interval)
         except asyncio.CancelledError:
             pass
 

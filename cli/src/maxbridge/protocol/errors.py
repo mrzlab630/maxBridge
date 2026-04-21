@@ -23,8 +23,9 @@ _ERROR_MAP: dict[str, str] = {
     ),
     "auth.code.invalid": "Invalid SMS code. Check and try again.",
     "auth.code.expired": "SMS code expired. Request a new one.",
-    "auth.token.expired": "Session token expired. Re-authenticate with SMS.",
-    "auth.token.invalid": "Session token invalid. Re-authenticate with SMS.",
+    "auth.token.expired": "Session token expired. Re-authenticate with QR code.",
+    "auth.token.invalid": "Session token invalid. Re-authenticate with QR code.",
+    "login.token": "Session token invalid. Re-authenticate with QR code.",
     "auth.phone.invalid": "Invalid phone number format. Use +7XXXXXXXXXX.",
     "auth.phone.blocked": "This phone number is blocked.",
     "auth.rate_limit": "Too many auth attempts. Wait and try again.",
@@ -56,3 +57,23 @@ class MaxConnectionError(Exception):
 
 class MaxAuthError(MaxApiError):
     """Authentication-specific error."""
+
+
+class MaxAuthRequiredError(RuntimeError):
+    """Saved auth token is no longer valid and must be refreshed."""
+
+
+class MaxPasswordChallengeRequired(RuntimeError):
+    """MAX requires the account password to complete auth."""
+
+    def __init__(self, challenge: dict) -> None:
+        self.challenge = challenge
+        hint = challenge.get("hint")
+        email = challenge.get("email")
+        details: list[str] = []
+        if hint:
+            details.append(f"hint={hint}")
+        if email:
+            details.append(f"email={email}")
+        suffix = f" ({', '.join(details)})" if details else ""
+        super().__init__(f"MAX requested account password to finish login{suffix}")
