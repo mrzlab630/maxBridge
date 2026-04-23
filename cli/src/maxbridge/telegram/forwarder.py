@@ -93,11 +93,10 @@ class TelegramForwarder:
         if msg.status == MessageStatus.DELETED:
             return
 
-        caption = self._format_header(msg)
         media = self._find_media(msg)
 
         if media:
-            sent = await self._send_media(media, caption, msg.text)
+            sent = await self._send_media(media, msg)
             if sent:
                 return
 
@@ -141,24 +140,11 @@ class TelegramForwarder:
         if control_text:
             return control_text[:_MAX_TEXT]
 
-        parts = [self._format_header(msg), "\n"]
-        if msg.text:
-            parts.append(_esc(msg.text))
-        for a in msg.attachments:
-            atype = a.get("type", "?")
-            data = a.get("data", {})
-            if atype == "AUDIO":
-                dur = data.get("duration", 0)
-                secs = dur // 1000 if dur > 100 else dur
-                parts.append(f"\n🎤 Голосовое ({secs}с)")
-            elif atype == "VIDEO":
-                dur = data.get("duration", 0)
-                secs = dur // 1000 if dur > 100 else dur
-                parts.append(f"\n🎬 Видео ({secs}с)")
-            else:
-                name = data.get("fileName") or data.get("name") or atype
-                parts.append(f"\n📎 {_esc(name)}")
-        return "".join(parts)[:_MAX_TEXT]
+        body_lines = self._format_body_lines(msg)
+        if not body_lines:
+            return self._format_header(msg)[:_MAX_TEXT]
+        full_text = f"{self._format_header(msg)}\n" + "\n".join(body_lines)
+        return full_text[:_MAX_TEXT]
 
     def _format_control_message(self, msg: UnifiedMessage) -> str | None:
         """Readable fallback for service actions like join/call/pin."""
@@ -189,9 +175,28 @@ class TelegramForwarder:
 
     def _find_media(self, msg: UnifiedMessage) -> dict | None:
         """Найти первое пересылаемое вложение."""
-        for a in msg.attachments:
-            atype = a.get("type", "")
-            data = a.get("data", {})
+        media = self._find_media_in_attachments(msg.attachments)
+        if media:
+            return media
+        if msg.link_type == "FORWARD" and msg.linked_message is not None:
+            return self._find_media_in_attachments(msg.linked_message.attachments)
+        return None
+
+    def _find_media_in_attachments(self,
+                                   attachments: list[dict[str, object]]) -> dict | None:
+        """Find the first downloadable media attachment in a list."""
+        for attachment in attachments:
+            atype = str(attachment.get("type", ""))
+            data = attachment.get("data", {})
+            if not isinstance(data, dict):
+                continue
+            if atype == "SHARE":
+                image = data.get("image")
+                if isinstance(image, dict):
+                    nested_type = str(image.get("_type", "PHOTO"))
+                    url = self._extract_url(nested_type, image)
+                    if url:
+                        return {"type": nested_type, "url": url, "data": image}
             url = self._extract_url(atype, data)
             if url:
                 return {"type": atype, "url": url, "data": data}
@@ -205,9 +210,15 @@ class TelegramForwarder:
         AUDIO/FILE url привязаны к IP и не скачиваются с другого сервера.
         """
         if atype == "PHOTO":
-            return data.get("baseUrl") or ""
+            return data.get("baseUrl") or data.get("url") or ""
         if atype == "VIDEO":
             return data.get("thumbnail") or ""
+        if atype == "SHARE":
+            image = data.get("image")
+            if isinstance(image, dict):
+                return TelegramForwarder._extract_url(
+                    str(image.get("_type", "PHOTO")), image,
+                )
         # AUDIO и FILE url привязаны к srcIp — не работают
         return ""
 
@@ -220,8 +231,7 @@ class TelegramForwarder:
 
     # ── Отправка медиа ──────────────────────────────────
 
-    async def _send_media(self, media: dict, caption: str,
-                          text: str) -> bool:
+    async def _send_media(self, media: dict, msg: UnifiedMessage) -> bool:
         """Скачать файл и отправить в Telegram."""
         atype = media["type"]
         url = media["url"]
@@ -230,10 +240,7 @@ class TelegramForwarder:
             if not file_bytes:
                 return False
 
-            full_caption = caption
-            if text:
-                full_caption += f"\n{_esc(text)}"
-            full_caption = full_caption[:_MAX_CAPTION]
+            full_caption = self._format_full(msg)[:_MAX_CAPTION]
 
             if atype == "PHOTO":
                 return await self._tg_send_file(
@@ -257,6 +264,69 @@ class TelegramForwarder:
         except Exception:
             logger.debug("Ошибка отправки медиа", exc_info=True)
         return False
+
+    def _format_body_lines(self, msg: UnifiedMessage) -> list[str]:
+        """Render wrapper text, attachments, and linked content into body lines."""
+        lines = []
+        if msg.link_type == "REPLY":
+            lines.extend(self._format_linked_block(msg))
+        if msg.text:
+            lines.append(_esc(msg.text))
+        lines.extend(self._format_attachment_lines(msg.attachments))
+        if msg.link_type != "REPLY":
+            lines.extend(self._format_linked_block(msg))
+        return lines
+
+    def _format_linked_block(self, msg: UnifiedMessage) -> list[str]:
+        """Render linked/quoted/forwarded content."""
+        if not msg.link_type:
+            return []
+
+        lines = [self._link_label(msg.link_type)]
+        linked = msg.linked_message
+        if linked is not None and linked.text:
+            lines.append(_esc(linked.text))
+        if linked is not None:
+            lines.extend(self._format_attachment_lines(linked.attachments))
+        if len(lines) == 1:
+            lines.append("<i>[без содержимого]</i>")
+        return lines
+
+    def _format_attachment_lines(self,
+                                 attachments: list[dict[str, object]]) -> list[str]:
+        """Render normalized attachments as readable text lines."""
+        lines = []
+        for attachment in attachments:
+            atype = str(attachment.get("type", "?"))
+            data = attachment.get("data", {})
+            if not isinstance(data, dict):
+                data = {}
+            if atype == "AUDIO":
+                dur = data.get("duration", 0)
+                secs = dur // 1000 if isinstance(dur, int) and dur > 100 else dur
+                lines.append(f"🎤 Голосовое ({secs}с)")
+            elif atype == "VIDEO":
+                dur = data.get("duration", 0)
+                secs = dur // 1000 if isinstance(dur, int) and dur > 100 else dur
+                lines.append(f"🎬 Видео ({secs}с)")
+            elif atype == "PHOTO":
+                lines.append("🖼 Фото")
+            elif atype == "SHARE":
+                title = data.get("title") or data.get("host") or data.get("url") or "Ссылка"
+                lines.append(f"🔗 {_esc(str(title))}")
+            else:
+                name = data.get("fileName") or data.get("name") or data.get("title") or atype
+                lines.append(f"📎 {_esc(str(name))}")
+        return lines
+
+    @staticmethod
+    def _link_label(link_type: str) -> str:
+        """Humanize linked message type."""
+        if link_type == "FORWARD":
+            return "↪ <b>Переслано</b>"
+        if link_type == "REPLY":
+            return "↩ <b>Ответ на сообщение</b>"
+        return f"🔗 <b>{_esc(link_type)}</b>"
 
     async def _download(self, url: str) -> bytes | None:
         """Скачать файл по URL."""

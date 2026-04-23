@@ -6,11 +6,12 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from maxbridge.telegram.forwarder import TelegramForwarder, TelegramLogHandler, _esc
-from maxbridge.utils.types import MessageStatus, UnifiedMessage
+from maxbridge.utils.types import LinkedMessage, MessageStatus, UnifiedMessage
 
 
 def _msg(text="hi", sender_name="Иван", chat_name="Общий",
-         status=MessageStatus.NEW, attachments=None):
+         status=MessageStatus.NEW, attachments=None,
+         link_type=None, link_chat_id=None, linked_message=None):
     return UnifiedMessage(
         account_id="default",
         chat_id=123,
@@ -21,6 +22,9 @@ def _msg(text="hi", sender_name="Иван", chat_name="Общий",
         sender_name=sender_name,
         chat_name=chat_name,
         attachments=attachments or [],
+        link_type=link_type,
+        link_chat_id=link_chat_id,
+        linked_message=linked_message,
     )
 
 
@@ -116,6 +120,36 @@ class TestFormatMessage:
         assert "совершил(а) действие" in full
         assert "member joined" in full
 
+    def test_format_full_with_forwarded_message(self):
+        fw = self._make_forwarder()
+        msg = _msg(
+            text="",
+            link_type="FORWARD",
+            link_chat_id=-42,
+            linked_message=LinkedMessage(
+                text="Пересланный текст",
+                attachments=[
+                    {"type": "SHARE", "data": {"title": "Субботник 29.04"}},
+                ],
+            ),
+        )
+        full = fw._format_full(msg)
+        assert "Переслано" in full
+        assert "Пересланный текст" in full
+        assert "Субботник 29.04" in full
+
+    def test_format_full_with_reply_message(self):
+        fw = self._make_forwarder()
+        msg = _msg(
+            text="Можно его тоже)",
+            link_type="REPLY",
+            linked_message=LinkedMessage(text="Один хватит"),
+        )
+        full = fw._format_full(msg)
+        assert "Ответ на сообщение" in full
+        assert "Один хватит" in full
+        assert "Можно его тоже)" in full
+
     def test_extract_url_photo(self):
         url = TelegramForwarder._extract_url(
             "PHOTO", {"baseUrl": "https://example.com/photo"})
@@ -149,6 +183,27 @@ class TestFormatMessage:
         ])
         media = fw._find_media(msg)
         assert media is None
+
+    def test_find_media_from_forwarded_share_preview(self):
+        fw = self._make_forwarder()
+        msg = _msg(
+            text="",
+            link_type="FORWARD",
+            linked_message=LinkedMessage(
+                attachments=[
+                    {
+                        "type": "SHARE",
+                        "data": {
+                            "image": {"_type": "PHOTO", "url": "https://x.com/share-preview"},
+                        },
+                    },
+                ],
+            ),
+        )
+        media = fw._find_media(msg)
+        assert media is not None
+        assert media["type"] == "PHOTO"
+        assert media["url"] == "https://x.com/share-preview"
 
     def test_format_alert(self):
         alert = TelegramForwarder._format_alert(
