@@ -1,5 +1,6 @@
 """Tests for MAX connection auth-failure handling."""
 
+import asyncio
 import os
 from unittest.mock import AsyncMock, MagicMock
 
@@ -36,3 +37,43 @@ class TestMaxConnection:
         fake_client.disconnect.assert_awaited_once()
         callback.assert_called_once()
         assert conn.is_connected is False
+
+    @pytest.mark.asyncio
+    async def test_disconnect_cancels_pending_reconnect_task(
+        self,
+        tmp_dir,
+        encryptor,
+    ):
+        session = Session(os.path.join(tmp_dir, "auth.session"), encryptor)
+        conn = MaxConnection(session)
+
+        started = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        async def fake_run_reconnect():
+            started.set()
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        conn._run_reconnect = fake_run_reconnect  # type: ignore[method-assign]
+
+        await conn._request_reconnect()
+        await started.wait()
+        await conn.disconnect()
+
+        assert cancelled.is_set()
+        assert conn._reconnect_task is None
+        assert conn.is_connected is False
+
+    @pytest.mark.asyncio
+    async def test_request_reconnect_ignored_during_shutdown(self, tmp_dir, encryptor):
+        session = Session(os.path.join(tmp_dir, "auth.session"), encryptor)
+        conn = MaxConnection(session)
+        conn._shutdown_requested = True
+
+        await conn._request_reconnect()
+
+        assert conn._reconnect_task is None

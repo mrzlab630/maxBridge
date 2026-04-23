@@ -29,6 +29,26 @@ from maxbridge.utils.logger import setup_logging
 logger = logging.getLogger("maxbridge.main")
 
 
+async def _drain_background_tasks(
+    loop: asyncio.AbstractEventLoop,
+    *,
+    shutdown_executor: bool = True,
+) -> None:
+    current = asyncio.current_task()
+    pending = [
+        task
+        for task in asyncio.all_tasks(loop)
+        if task is not current and not task.done()
+    ]
+    if pending:
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+    await loop.shutdown_asyncgens()
+    if shutdown_executor:
+        await loop.shutdown_default_executor()
+
+
 class MaxBridgeDaemon:
     """Main daemon: multi-account, entity cache, stats, IPC server."""
 
@@ -290,8 +310,11 @@ def cli_entry() -> None:
         logger.exception("Unhandled maxBridge error")
         print(f"\n[ERROR] {e}")
     finally:
-        loop.run_until_complete(daemon.stop())
-        loop.close()
+        try:
+            loop.run_until_complete(daemon.stop())
+            loop.run_until_complete(_drain_background_tasks(loop))
+        finally:
+            loop.close()
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@ keepalive, hello, SMS auth, token auth, reconnect callback.
 """
 
 import asyncio
+import contextlib
 import itertools
 import json
 import logging
@@ -87,6 +88,7 @@ class MaxClient:
         self._reconnect_callback: ReconnectCallback | None = None
         self._device_id: str | None = None
         self._is_logged_in = False
+        self._closing = False
 
     @property
     def device_id(self) -> str | None:
@@ -103,6 +105,7 @@ class MaxClient:
         if self._connection:
             raise RuntimeError("Already connected")
 
+        self._closing = False
         self._connection = await websockets.connect(
             self._ws_host,
             additional_headers={
@@ -115,23 +118,40 @@ class MaxClient:
 
     async def disconnect(self) -> None:
         """Gracefully close everything."""
+        self._closing = True
         self._is_logged_in = False
-        if self._keepalive_task and not self._keepalive_task.done():
-            self._keepalive_task.cancel()
-            self._keepalive_task = None
-        if self._recv_task and not self._recv_task.done():
-            self._recv_task.cancel()
-            self._recv_task = None
-        if self._connection:
+        current = asyncio.current_task()
+        tasks_to_wait: list[asyncio.Task] = []
+
+        keepalive_task = self._keepalive_task
+        self._keepalive_task = None
+        if keepalive_task and not keepalive_task.done():
+            keepalive_task.cancel()
+            if keepalive_task is not current:
+                tasks_to_wait.append(keepalive_task)
+
+        recv_task = self._recv_task
+        self._recv_task = None
+        if recv_task and not recv_task.done():
+            recv_task.cancel()
+            if recv_task is not current:
+                tasks_to_wait.append(recv_task)
+
+        connection = self._connection
+        self._connection = None
+        if connection:
             try:
-                await self._connection.close()
+                await connection.close()
             except Exception:
                 pass
-            self._connection = None
+        if tasks_to_wait:
+            await asyncio.gather(*tasks_to_wait, return_exceptions=True)
         # Resolve any pending futures with error
         for fut in self._pending.values():
             if not fut.done():
-                fut.set_exception(ConnectionError("Disconnected"))
+                fut.set_exception(MaxConnectionError("Disconnected"))
+                with contextlib.suppress(Exception):
+                    fut.exception()
         self._pending.clear()
 
     def set_packet_callback(self, callback: PacketCallback) -> None:
@@ -163,13 +183,32 @@ class MaxClient:
         future = asyncio.get_running_loop().create_future()
         self._pending[seq] = future
 
-        await self._connection.send(json.dumps(request))
-
         try:
-            response = await asyncio.wait_for(future, timeout=timeout)
-        except asyncio.TimeoutError:
-            self._pending.pop(seq, None)
+            await self._connection.send(json.dumps(request))
+            done, _ = await asyncio.wait(
+                {future},
+                timeout=timeout,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if not done:
+                if not future.done():
+                    future.cancel()
+                raise asyncio.TimeoutError()
+            response = future.result()
+        except asyncio.CancelledError:
+            if not future.done():
+                future.cancel()
             raise
+        except asyncio.TimeoutError:
+            if not future.done():
+                future.cancel()
+            raise
+        except Exception:
+            if not future.done():
+                future.cancel()
+            raise
+        finally:
+            self._pending.pop(seq, None)
         resp_payload = response.get("payload") or {}
         logger.debug("<- opcode=%d seq=%d keys=%s", opcode, seq,
                       list(resp_payload.keys()))
@@ -352,8 +391,7 @@ class MaxClient:
                     )
                 except asyncio.TimeoutError:
                     logger.warning("Keepalive timeout")
-                    if self._reconnect_callback:
-                        asyncio.create_task(self._reconnect_callback())
+                    self._schedule_reconnect()
                     return
                 except Exception as e:
                     logger.warning("Keepalive error: %s", e)
@@ -390,8 +428,7 @@ class MaxClient:
                     logger.debug("<< unhandled op=%s seq=%s", op, seq)
         except websockets.exceptions.ConnectionClosed:
             logger.warning("WebSocket connection closed")
-            if self._reconnect_callback:
-                asyncio.create_task(self._reconnect_callback())
+            self._schedule_reconnect()
         except asyncio.CancelledError:
             pass
 
@@ -401,3 +438,8 @@ class MaxClient:
             await self._packet_callback(self, packet)
         except Exception:
             logger.exception("Packet callback error")
+
+    def _schedule_reconnect(self) -> None:
+        if self._closing or self._reconnect_callback is None:
+            return
+        asyncio.create_task(self._reconnect_callback())

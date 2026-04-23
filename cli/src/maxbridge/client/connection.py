@@ -1,6 +1,7 @@
 """MaxClient wrapper with auto-reconnect, heartbeat, and lifecycle management."""
 
 import asyncio
+import contextlib
 import logging
 from typing import Any, Callable
 
@@ -28,6 +29,8 @@ class MaxConnection:
         self._on_fatal_callback: Callable[[], None] | None = None
         self._on_auth_required_callback: Callable[[Exception], None] | None = None
         self._reconnecting = False
+        self._reconnect_task: asyncio.Task | None = None
+        self._shutdown_requested = False
 
     @property
     def client(self) -> MaxClient:
@@ -60,6 +63,7 @@ class MaxConnection:
 
     async def connect(self) -> MaxClient:
         """Create client, connect, authenticate with saved token."""
+        self._shutdown_requested = False
         self._client = MaxClient()
         await self._client.connect()
         try:
@@ -70,7 +74,7 @@ class MaxConnection:
             raise
         self._connected = True
 
-        self._client.set_reconnect_callback(self._on_reconnect)
+        self._client.set_reconnect_callback(self._request_reconnect)
         if self._packet_callback:
             self._client.set_packet_callback(self._packet_callback)
 
@@ -83,14 +87,23 @@ class MaxConnection:
             self._client.set_packet_callback(callback)
 
     async def disconnect(self) -> None:
+        self._shutdown_requested = True
+        reconnect_task = self._reconnect_task
+        self._reconnect_task = None
+        if reconnect_task and not reconnect_task.done():
+            reconnect_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await reconnect_task
+
         if self._client:
             try:
                 await self._client.disconnect()
             except Exception as e:
                 logger.warning("Disconnect error: %s", e)
             self._client = None
-            self._connected = False
             logger.info("Disconnected from MAX")
+        self._connected = False
+        self._reconnecting = False
 
     async def _cleanup_failed_client(self) -> None:
         if self._client:
@@ -149,9 +162,27 @@ class MaxConnection:
             payload={"contactIds": user_ids},
         )
 
-    async def _on_reconnect(self) -> None:
+    async def _request_reconnect(self) -> None:
+        if self._shutdown_requested:
+            return
+        if self._reconnect_task and not self._reconnect_task.done():
+            return
+
+        task = asyncio.create_task(self._run_reconnect(), name="maxbridge-reconnect")
+        self._reconnect_task = task
+        task.add_done_callback(self._clear_reconnect_task)
+
+    def _clear_reconnect_task(self, task: asyncio.Task) -> None:
+        if self._reconnect_task is task:
+            self._reconnect_task = None
+        with contextlib.suppress(asyncio.CancelledError):
+            exc = task.exception()
+            if exc is not None:
+                logger.exception("Reconnect task crashed", exc_info=exc)
+
+    async def _run_reconnect(self) -> None:
         """Reconnect with exponential backoff. Inline client creation."""
-        if self._reconnecting:
+        if self._shutdown_requested or self._reconnecting:
             return
         self._reconnecting = True
         self._connected = False
@@ -163,41 +194,53 @@ class MaxConnection:
                 pass
             self._client = None
 
-        for attempt in range(1, self._max_retries + 1):
-            delay = min(self._reconnect_delay * attempt, 60)
-            logger.warning("Reconnecting in %ds (attempt %d/%d)...",
-                           delay, attempt, self._max_retries)
-            await asyncio.sleep(delay)
-            try:
-                client = MaxClient()
-                await client.connect()
-                await login_with_token(client, self._session)
+        try:
+            for attempt in range(1, self._max_retries + 1):
+                if self._shutdown_requested:
+                    return
 
-                self._client = client
-                self._connected = True
-                client.set_reconnect_callback(self._on_reconnect)
-                if self._packet_callback:
-                    client.set_packet_callback(self._packet_callback)
+                delay = min(self._reconnect_delay * attempt, 60)
+                logger.warning("Reconnecting in %ds (attempt %d/%d)...",
+                               delay, attempt, self._max_retries)
+                await asyncio.sleep(delay)
+                if self._shutdown_requested:
+                    return
 
-                self._reconnecting = False
-                logger.info("Reconnected on attempt %d", attempt)
-                return
-            except MaxAuthRequiredError as exc:
+                client: MaxClient | None = None
                 try:
-                    await client.disconnect()
-                except Exception:
-                    logger.debug("Disconnect error after auth failure", exc_info=True)
-                self._notify_auth_required(exc)
-                self._reconnecting = False
-                logger.warning("Reconnect stopped: authentication required")
-                return
-            except Exception:
-                logger.exception("Reconnect attempt %d failed", attempt)
+                    client = MaxClient()
+                    await client.connect()
+                    await login_with_token(client, self._session)
 
-        self._reconnecting = False
-        logger.critical("Failed to reconnect after %d attempts", self._max_retries)
-        if self._on_fatal_callback:
-            self._on_fatal_callback()
+                    if self._shutdown_requested:
+                        await client.disconnect()
+                        return
+
+                    self._client = client
+                    self._connected = True
+                    client.set_reconnect_callback(self._request_reconnect)
+                    if self._packet_callback:
+                        client.set_packet_callback(self._packet_callback)
+
+                    logger.info("Reconnected on attempt %d", attempt)
+                    return
+                except MaxAuthRequiredError as exc:
+                    if client is not None:
+                        try:
+                            await client.disconnect()
+                        except Exception:
+                            logger.debug("Disconnect error after auth failure", exc_info=True)
+                    self._notify_auth_required(exc)
+                    logger.warning("Reconnect stopped: authentication required")
+                    return
+                except Exception:
+                    logger.exception("Reconnect attempt %d failed", attempt)
+
+            logger.critical("Failed to reconnect after %d attempts", self._max_retries)
+            if self._on_fatal_callback:
+                self._on_fatal_callback()
+        finally:
+            self._reconnecting = False
 
     def _notify_auth_required(self, exc: Exception) -> None:
         if self._on_auth_required_callback is None:

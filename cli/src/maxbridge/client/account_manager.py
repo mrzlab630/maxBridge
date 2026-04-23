@@ -87,11 +87,10 @@ class AccountManager:
     async def disconnect_all(self) -> None:
         """Disconnect all connected accounts."""
         for account_id, account in self._accounts.items():
-            if account.is_connected:
-                try:
-                    await account.disconnect()
-                except Exception as e:
-                    logger.warning("Error disconnecting '%s': %s", account_id, e)
+            try:
+                await account.disconnect()
+            except Exception as e:
+                logger.warning("Error disconnecting '%s': %s", account_id, e)
 
     def status(self) -> dict[str, dict[str, Any]]:
         """Return status of all accounts."""
