@@ -73,7 +73,7 @@ maxBridge/
     │   ├── commander.py           ← CLI шелл
     │   ├── config.py              ← Загрузка YAML конфига
     │   └── main.py                ← Демон
-    ├── tests/                     ← 78 юнит-тестов
+    ├── tests/                     ← 175 юнит-тестов
     ├── examples/                  ← Пример IPC клиента
     ├── deploy/                    ← systemd + install.sh
     └── pyproject.toml
@@ -311,7 +311,7 @@ cd maxBridge/cli && source .venv/bin/activate
 python -m pytest tests/ -v
 ```
 
-Сейчас в проекте 171 unit-тест.
+Сейчас в проекте 175 unit-тестов.
 
 ## Лицензия
 
