@@ -28,6 +28,11 @@ _API = "https://api.telegram.org/bot{token}/{method}"
 _MAX_TEXT = 4096
 _POLL_TIMEOUT = 30
 _RETRY_DELAY = 3
+_TRANSIENT_REQUEST_ERRORS = (
+    aiohttp.ClientConnectionError,
+    aiohttp.ClientPayloadError,
+    asyncio.TimeoutError,
+)
 _SECRET_IGNORED_CHARS = frozenset({
     "\u200b",  # zero width space
     "\u200c",  # zero width non-joiner
@@ -478,6 +483,14 @@ class TelegramControlBot:
                 return await self._parse_tg_response(method, resp)
         except asyncio.CancelledError:
             raise
+        except _TRANSIENT_REQUEST_ERRORS as exc:
+            logger.warning(
+                "Telegram control bot %s transient request error: %s: %s",
+                method,
+                exc.__class__.__name__,
+                exc,
+            )
+            return None
         except Exception:
             logger.exception("Telegram control bot %s request failed", method)
             return None

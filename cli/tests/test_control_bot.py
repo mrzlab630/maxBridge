@@ -1,8 +1,10 @@
 """Tests for the Telegram control bot."""
 
 import asyncio
+import logging
 from unittest.mock import AsyncMock, MagicMock
 
+import aiohttp
 import pytest
 
 import maxbridge.telegram.control_bot as control_bot_module
@@ -227,3 +229,37 @@ class TestTelegramControlBot:
         assert response == {"result": {"message_id": 6}}
         bot._send_photo.assert_awaited_once()
         bot._send_message.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_call_logs_transient_disconnect_as_warning(self, caplog):
+        bot, _manager = self._make_bot()
+        bot._http = _FailingHttp(
+            aiohttp.ServerDisconnectedError("Server disconnected"),
+        )
+
+        with caplog.at_level(logging.WARNING, logger="maxbridge.telegram.control_bot"):
+            result = await bot._call("getUpdates", {"timeout": 30})
+
+        assert result is None
+        assert "transient request error" in caplog.text
+        assert "ServerDisconnectedError" in caplog.text
+        assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+
+class _FailingHttp:
+    def __init__(self, exc: Exception) -> None:
+        self._exc = exc
+
+    def post(self, *_args, **_kwargs):
+        return _FailingContext(self._exc)
+
+
+class _FailingContext:
+    def __init__(self, exc: Exception) -> None:
+        self._exc = exc
+
+    async def __aenter__(self):
+        raise self._exc
+
+    async def __aexit__(self, *_args):
+        return False
