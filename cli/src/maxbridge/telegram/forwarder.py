@@ -7,6 +7,7 @@ import aiohttp
 
 from maxbridge.bridge.event_bus import EventBus
 from maxbridge.client.account_manager import AccountManager
+from maxbridge.media.uploader import get_download_url
 from maxbridge.telegram.config import TelegramConfig, load_telegram_config
 from maxbridge.utils.types import MessageStatus, UnifiedMessage
 
@@ -197,6 +198,17 @@ class TelegramForwarder:
                     url = self._extract_url(nested_type, image)
                     if url:
                         return {"type": nested_type, "url": url, "data": image}
+            if atype == "VIDEO":
+                url = self._extract_url(atype, data)
+                file_id = self._extract_file_id(data)
+                if url or file_id is not None:
+                    return {
+                        "type": atype,
+                        "url": url,
+                        "file_id": file_id,
+                        "data": data,
+                    }
+                continue
             url = self._extract_url(atype, data)
             if url:
                 return {"type": atype, "url": url, "data": data}
@@ -206,13 +218,20 @@ class TelegramForwarder:
     def _extract_url(atype: str, data: dict) -> str:
         """Извлечь URL для скачивания из вложения MAX.
 
-        Только URL которые не привязаны к IP (baseUrl, thumbnail).
+        Только URL которые указывают на само медиа. Thumbnail для VIDEO не
+        подходит: Telegram тогда получает картинку вместо видео.
         AUDIO/FILE url привязаны к IP и не скачиваются с другого сервера.
         """
         if atype == "PHOTO":
-            return data.get("baseUrl") or data.get("url") or ""
+            return TelegramForwarder._first_str(data, "baseUrl", "url")
         if atype == "VIDEO":
-            return data.get("thumbnail") or ""
+            return TelegramForwarder._first_str(
+                data,
+                "baseUrl",
+                "url",
+                "downloadUrl",
+                "videoUrl",
+            )
         if atype == "SHARE":
             image = data.get("image")
             if isinstance(image, dict):
@@ -221,6 +240,27 @@ class TelegramForwarder:
                 )
         # AUDIO и FILE url привязаны к srcIp — не работают
         return ""
+
+    @staticmethod
+    def _first_str(data: dict, *keys: str) -> str:
+        for key in keys:
+            value = data.get(key)
+            if isinstance(value, str) and value:
+                return value
+        return ""
+
+    @staticmethod
+    def _extract_file_id(data: dict) -> int | None:
+        """Extract numeric MAX file id used by DOWNLOAD_VIDEO/DOWNLOAD_FILE."""
+        for key in ("fileId", "videoId", "id"):
+            value = data.get(key)
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, int) and value > 0:
+                return value
+            if isinstance(value, str) and value.isdigit():
+                return int(value)
+        return None
 
     @staticmethod
     def _format_alert(title: str, text: str) -> str:
@@ -234,36 +274,81 @@ class TelegramForwarder:
     async def _send_media(self, media: dict, msg: UnifiedMessage) -> bool:
         """Скачать файл и отправить в Telegram."""
         atype = media["type"]
-        url = media["url"]
         try:
+            if atype == "VIDEO":
+                url = await self._resolve_video_url(media, msg)
+            else:
+                url = str(media.get("url") or "")
+            if not url:
+                return False
+
             file_bytes = await self._download(url)
             if not file_bytes:
                 return False
 
             full_caption = self._format_full(msg)[:_MAX_CAPTION]
+            data = media.get("data", {})
+            if not isinstance(data, dict):
+                data = {}
 
             if atype == "PHOTO":
                 return await self._tg_send_file(
                     "sendPhoto", "photo", file_bytes,
                     "photo.jpg", full_caption)
             elif atype == "VIDEO":
-                # Thumbnail — отправляем как фото с пометкой
                 return await self._tg_send_file(
-                    "sendPhoto", "photo", file_bytes,
-                    "video_preview.jpg",
-                    f"🎬 {full_caption}")
+                    "sendVideo", "video", file_bytes,
+                    self._video_filename(data), full_caption)
             elif atype == "AUDIO":
                 return await self._tg_send_file(
                     "sendVoice", "voice", file_bytes,
                     "voice.ogg", full_caption)
             elif atype == "FILE":
-                name = media["data"].get("fileName") or "file"
+                name = data.get("fileName") or "file"
                 return await self._tg_send_file(
                     "sendDocument", "document", file_bytes,
                     name, full_caption)
         except Exception:
             logger.debug("Ошибка отправки медиа", exc_info=True)
         return False
+
+    async def _resolve_video_url(self, media: dict, msg: UnifiedMessage) -> str:
+        """Resolve a real video download URL, never the preview thumbnail."""
+        url = str(media.get("url") or "")
+        if url:
+            return url
+
+        file_id = media.get("file_id")
+        if not isinstance(file_id, int):
+            data = media.get("data", {})
+            if isinstance(data, dict):
+                file_id = self._extract_file_id(data)
+        if not isinstance(file_id, int):
+            return ""
+
+        account = self._manager.get(msg.account_id)
+        if account is None or not account.is_connected:
+            return ""
+
+        try:
+            return await get_download_url(
+                account.connection,
+                msg.chat_id,
+                msg.message_id,
+                file_id,
+                "video",
+            )
+        except Exception:
+            logger.debug("Не удалось получить URL видео MAX", exc_info=True)
+            return ""
+
+    @staticmethod
+    def _video_filename(data: dict) -> str:
+        name = data.get("fileName") or data.get("name") or "video.mp4"
+        filename = str(name)
+        if "." not in filename:
+            return f"{filename}.mp4"
+        return filename
 
     def _format_body_lines(self, msg: UnifiedMessage) -> list[str]:
         """Render wrapper text, attachments, and linked content into body lines."""

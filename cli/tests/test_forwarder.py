@@ -5,17 +5,18 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from maxbridge.telegram import forwarder as forwarder_module
 from maxbridge.telegram.forwarder import TelegramForwarder, TelegramLogHandler, _esc
 from maxbridge.utils.types import LinkedMessage, MessageStatus, UnifiedMessage
 
 
-def _msg(text="hi", sender_name="Иван", chat_name="Общий",
+def _msg(text="hi", sender_name="Иван", chat_name="Общий", message_id="m1",
          status=MessageStatus.NEW, attachments=None,
          link_type=None, link_chat_id=None, linked_message=None):
     return UnifiedMessage(
         account_id="default",
         chat_id=123,
-        message_id="m1",
+        message_id=message_id,
         status=status,
         text=text,
         sender_id=1,
@@ -155,10 +156,20 @@ class TestFormatMessage:
             "PHOTO", {"baseUrl": "https://example.com/photo"})
         assert url == "https://example.com/photo"
 
-    def test_extract_url_video(self):
+    def test_extract_url_video_prefers_real_media_url(self):
         url = TelegramForwarder._extract_url(
-            "VIDEO", {"thumbnail": "https://example.com/thumb"})
-        assert url == "https://example.com/thumb"
+            "VIDEO",
+            {
+                "url": "https://example.com/video.mp4",
+                "thumbnail": "https://example.com/thumb.jpg",
+            },
+        )
+        assert url == "https://example.com/video.mp4"
+
+    def test_extract_url_video_ignores_thumbnail_preview(self):
+        url = TelegramForwarder._extract_url(
+            "VIDEO", {"thumbnail": "https://example.com/thumb.jpg"})
+        assert url == ""
 
     def test_extract_url_audio_returns_empty(self):
         """AUDIO url привязан к IP — не возвращаем."""
@@ -183,6 +194,19 @@ class TestFormatMessage:
         ])
         media = fw._find_media(msg)
         assert media is None
+
+    def test_find_media_video_with_file_id(self):
+        fw = self._make_forwarder()
+        msg = _msg(attachments=[
+            {"type": "VIDEO", "data": {"fileId": 42, "thumbnail": "https://x.com/thumb"}}
+        ])
+
+        media = fw._find_media(msg)
+
+        assert media is not None
+        assert media["type"] == "VIDEO"
+        assert media["url"] == ""
+        assert media["file_id"] == 42
 
     def test_find_media_from_forwarded_share_preview(self):
         fw = self._make_forwarder()
@@ -256,6 +280,52 @@ class TestErrorNotifications:
         handler.emit(record)
 
         fw.send_alert_nowait.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_send_media_video_uses_send_video_not_photo(self):
+        fw = self._make_forwarder()
+        fw._download = AsyncMock(return_value=b"video-bytes")
+        fw._tg_send_file = AsyncMock(return_value=True)
+        msg = _msg(text="clip", attachments=[
+            {"type": "VIDEO", "data": {"url": "https://x.com/video.mp4"}}
+        ])
+
+        result = await fw._send_media(
+            {"type": "VIDEO", "url": "https://x.com/video.mp4", "data": {}},
+            msg,
+        )
+
+        assert result is True
+        fw._download.assert_awaited_once_with("https://x.com/video.mp4")
+        fw._tg_send_file.assert_awaited_once()
+        args = fw._tg_send_file.await_args.args
+        assert args[:4] == ("sendVideo", "video", b"video-bytes", "video.mp4")
+
+    @pytest.mark.asyncio
+    async def test_send_media_video_resolves_download_url_by_file_id(self, monkeypatch):
+        fw = self._make_forwarder()
+        account = MagicMock()
+        account.is_connected = True
+        account.connection = MagicMock()
+        fw._manager.get.return_value = account
+        get_download_url = AsyncMock(return_value="https://x.com/download/video.mp4")
+        monkeypatch.setattr(forwarder_module, "get_download_url", get_download_url)
+        fw._download = AsyncMock(return_value=b"video-bytes")
+        fw._tg_send_file = AsyncMock(return_value=True)
+        msg = _msg(message_id="m-video")
+
+        result = await fw._send_media(
+            {"type": "VIDEO", "url": "", "file_id": 42, "data": {"fileName": "clip"}},
+            msg,
+        )
+
+        assert result is True
+        get_download_url.assert_awaited_once_with(
+            account.connection, 123, "m-video", 42, "video",
+        )
+        fw._download.assert_awaited_once_with("https://x.com/download/video.mp4")
+        args = fw._tg_send_file.await_args.args
+        assert args[:4] == ("sendVideo", "video", b"video-bytes", "clip.mp4")
 
     @pytest.mark.asyncio
     async def test_send_alert_uses_send_text(self):
