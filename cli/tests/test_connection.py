@@ -39,6 +39,26 @@ class TestMaxConnection:
         assert conn.is_connected is False
 
     @pytest.mark.asyncio
+    async def test_connect_cleans_failed_client(self, monkeypatch, tmp_dir, encryptor):
+        session = Session(os.path.join(tmp_dir, "connect.session"), encryptor)
+        session.save("dev123", "tok123")
+
+        fake_client = MagicMock()
+        fake_client.connect = AsyncMock(side_effect=TimeoutError("handshake timeout"))
+        fake_client.disconnect = AsyncMock()
+
+        monkeypatch.setattr("maxbridge.client.connection.MaxClient", lambda: fake_client)
+
+        conn = MaxConnection(session)
+
+        with pytest.raises(TimeoutError, match="handshake timeout"):
+            await conn.connect()
+
+        fake_client.disconnect.assert_awaited_once()
+        assert conn._client is None
+        assert conn.is_connected is False
+
+    @pytest.mark.asyncio
     async def test_disconnect_cancels_pending_reconnect_task(
         self,
         tmp_dir,

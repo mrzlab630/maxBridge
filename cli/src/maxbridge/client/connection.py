@@ -65,12 +65,15 @@ class MaxConnection:
         """Create client, connect, authenticate with saved token."""
         self._shutdown_requested = False
         self._client = MaxClient()
-        await self._client.connect()
         try:
+            await self._client.connect()
             await login_with_token(self._client, self._session)
         except MaxAuthRequiredError as exc:
             await self._cleanup_failed_client()
             self._notify_auth_required(exc)
+            raise
+        except Exception:
+            await self._cleanup_failed_client()
             raise
         self._connected = True
 
@@ -163,14 +166,19 @@ class MaxConnection:
         )
 
     async def _request_reconnect(self) -> None:
+        self.reconnect_nowait()
+
+    def reconnect_nowait(self) -> bool:
+        """Start reconnect loop in the background if one is not already running."""
         if self._shutdown_requested:
-            return
+            return False
         if self._reconnect_task and not self._reconnect_task.done():
-            return
+            return False
 
         task = asyncio.create_task(self._run_reconnect(), name="maxbridge-reconnect")
         self._reconnect_task = task
         task.add_done_callback(self._clear_reconnect_task)
+        return True
 
     def _clear_reconnect_task(self, task: asyncio.Task) -> None:
         if self._reconnect_task is task:
@@ -233,8 +241,14 @@ class MaxConnection:
                     self._notify_auth_required(exc)
                     logger.warning("Reconnect stopped: authentication required")
                     return
-                except Exception:
-                    logger.exception("Reconnect attempt %d failed", attempt)
+                except Exception as exc:
+                    logger.warning(
+                        "Reconnect attempt %d/%d failed: %s: %s",
+                        attempt,
+                        self._max_retries,
+                        exc.__class__.__name__,
+                        exc,
+                    )
 
             logger.critical("Failed to reconnect after %d attempts", self._max_retries)
             if self._on_fatal_callback:

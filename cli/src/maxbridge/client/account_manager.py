@@ -5,6 +5,7 @@ from typing import Any, Callable
 
 from maxbridge.auth.encryption import TokenEncryptor
 from maxbridge.client.account import Account
+from maxbridge.protocol.errors import MaxAuthRequiredError
 from maxbridge.utils.types import PacketHandler
 
 logger = logging.getLogger("maxbridge.client.account_manager")
@@ -79,8 +80,22 @@ class AccountManager:
             if account.load_session():
                 try:
                     await account.connect()
-                except Exception:
-                    logger.exception("Failed to connect account '%s'", account_id)
+                except MaxAuthRequiredError:
+                    logger.warning("Account '%s' requires re-authentication", account_id)
+                except Exception as exc:
+                    reconnecting = account.connection.reconnect_nowait()
+                    state = (
+                        "background reconnect started"
+                        if reconnecting
+                        else "reconnect already active"
+                    )
+                    logger.warning(
+                        "Initial connect failed for account '%s': %s: %s; %s",
+                        account_id,
+                        exc.__class__.__name__,
+                        exc,
+                        state,
+                    )
             else:
                 logger.warning("Account '%s' has no session — run --auth-only", account_id)
 
