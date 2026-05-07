@@ -32,7 +32,11 @@ async def login_with_token(client: MaxClient, session: Session) -> dict[str, Any
                 "Token login failed — re-authenticate with QR",
             ) from e
 
-        logger.exception("Token login failed (transient error — session preserved)")
+        logger.warning(
+            "Token login failed (transient error — session preserved): %s: %s",
+            e.__class__.__name__,
+            e,
+        )
         raise RuntimeError("Token login failed — transient error, session preserved") from e
 
 
