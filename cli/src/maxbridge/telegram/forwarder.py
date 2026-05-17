@@ -94,12 +94,17 @@ class TelegramForwarder:
         if msg.status == MessageStatus.DELETED:
             return
 
-        media = self._find_media(msg)
+        media_items = self._collect_media(msg)
 
-        if media:
-            sent = await self._send_media(media, msg)
-            if sent:
+        if media_items:
+            sent_count, failed = await self._send_media_items(media_items, msg)
+            if sent_count == len(media_items):
                 return
+            if failed:
+                await self._send_text(self._format_failed_attachments(msg, failed))
+                return
+        elif self._has_non_control_attachments(msg):
+            self._log_unforwardable_attachments(msg)
 
         # Fallback: текст
         text = self._format_full(msg)
@@ -176,16 +181,30 @@ class TelegramForwarder:
 
     def _find_media(self, msg: UnifiedMessage) -> dict | None:
         """Найти первое пересылаемое вложение."""
-        media = self._find_media_in_attachments(msg.attachments)
-        if media:
-            return media
-        if msg.link_type == "FORWARD" and msg.linked_message is not None:
-            return self._find_media_in_attachments(msg.linked_message.attachments)
+        media_items = self._collect_media(msg)
+        if media_items:
+            return media_items[0]
         return None
+
+    def _collect_media(self, msg: UnifiedMessage) -> list[dict]:
+        """Collect every downloadable attachment that should be sent to Telegram."""
+        media_items = self._collect_media_in_attachments(msg.attachments)
+        if msg.link_type == "FORWARD" and msg.linked_message is not None:
+            media_items.extend(
+                self._collect_media_in_attachments(msg.linked_message.attachments),
+            )
+        return media_items
 
     def _find_media_in_attachments(self,
                                    attachments: list[dict[str, object]]) -> dict | None:
         """Find the first downloadable media attachment in a list."""
+        media_items = self._collect_media_in_attachments(attachments)
+        return media_items[0] if media_items else None
+
+    def _collect_media_in_attachments(self,
+                                      attachments: list[dict[str, object]]) -> list[dict]:
+        """Find every downloadable media attachment in a list."""
+        media_items = []
         for attachment in attachments:
             atype = str(attachment.get("type", ""))
             data = attachment.get("data", {})
@@ -197,22 +216,26 @@ class TelegramForwarder:
                     nested_type = str(image.get("_type", "PHOTO"))
                     url = self._extract_url(nested_type, image)
                     if url:
-                        return {"type": nested_type, "url": url, "data": image}
-            if atype == "VIDEO":
-                url = self._extract_url(atype, data)
-                file_id = self._extract_file_id(data)
-                if url or file_id is not None:
-                    return {
-                        "type": atype,
-                        "url": url,
-                        "file_id": file_id,
-                        "data": data,
-                    }
+                        media_items.append({
+                            "type": nested_type,
+                            "url": url,
+                            "file_id": self._extract_file_id(image),
+                            "data": image,
+                        })
                 continue
+
             url = self._extract_url(atype, data)
-            if url:
-                return {"type": atype, "url": url, "data": data}
-        return None
+            file_id = self._extract_file_id(data)
+            if not url and atype not in {"PHOTO", "VIDEO"}:
+                url = self._extract_file_url(data)
+            if url or file_id is not None:
+                media_items.append({
+                    "type": atype,
+                    "url": url,
+                    "file_id": file_id,
+                    "data": data,
+                })
+        return media_items
 
     @staticmethod
     def _extract_url(atype: str, data: dict) -> str:
@@ -242,6 +265,17 @@ class TelegramForwarder:
         return ""
 
     @staticmethod
+    def _extract_file_url(data: dict) -> str:
+        """Best-effort direct URL fallback for document-like attachments."""
+        return TelegramForwarder._first_str(
+            data,
+            "downloadUrl",
+            "fileUrl",
+            "url",
+            "baseUrl",
+        )
+
+    @staticmethod
     def _first_str(data: dict, *keys: str) -> str:
         for key in keys:
             value = data.get(key)
@@ -252,7 +286,7 @@ class TelegramForwarder:
     @staticmethod
     def _extract_file_id(data: dict) -> int | None:
         """Extract numeric MAX file id used by DOWNLOAD_VIDEO/DOWNLOAD_FILE."""
-        for key in ("fileId", "videoId", "id"):
+        for key in ("fileId", "file_id", "videoId", "video_id", "id"):
             value = data.get(key)
             if isinstance(value, bool):
                 continue
@@ -260,6 +294,13 @@ class TelegramForwarder:
                 return value
             if isinstance(value, str) and value.isdigit():
                 return int(value)
+
+        for key in ("file", "video", "media", "document"):
+            nested = data.get(key)
+            if isinstance(nested, dict):
+                value = TelegramForwarder._extract_file_id(nested)
+                if value is not None:
+                    return value
         return None
 
     @staticmethod
@@ -271,22 +312,37 @@ class TelegramForwarder:
 
     # ── Отправка медиа ──────────────────────────────────
 
-    async def _send_media(self, media: dict, msg: UnifiedMessage) -> bool:
+    async def _send_media_items(self, media_items: list[dict],
+                                msg: UnifiedMessage) -> tuple[int, list[dict]]:
+        """Send all media attachments, putting the message caption on first success."""
+        sent_count = 0
+        failed = []
+        caption = self._format_media_caption(msg)[:_MAX_CAPTION]
+        for media in media_items:
+            media_caption = caption if sent_count == 0 else ""
+            sent = await self._send_media(media, msg, caption=media_caption)
+            if sent:
+                sent_count += 1
+            else:
+                failed.append(media)
+        return sent_count, failed
+
+    async def _send_media(self, media: dict, msg: UnifiedMessage,
+                          caption: str | None = None) -> bool:
         """Скачать файл и отправить в Telegram."""
         atype = media["type"]
         try:
-            if atype == "VIDEO":
-                url = await self._resolve_video_url(media, msg)
-            else:
-                url = str(media.get("url") or "")
+            url = await self._resolve_media_url(media, msg)
             if not url:
+                self._log_media_failure("download URL missing", media, msg)
                 return False
 
             file_bytes = await self._download(url)
             if not file_bytes:
+                self._log_media_failure("download failed", media, msg)
                 return False
 
-            full_caption = self._format_full(msg)[:_MAX_CAPTION]
+            full_caption = self._format_full(msg)[:_MAX_CAPTION] if caption is None else caption
             data = media.get("data", {})
             if not isinstance(data, dict):
                 data = {}
@@ -302,9 +358,9 @@ class TelegramForwarder:
             elif atype == "AUDIO":
                 return await self._tg_send_file(
                     "sendVoice", "voice", file_bytes,
-                    "voice.ogg", full_caption)
-            elif atype == "FILE":
-                name = data.get("fileName") or "file"
+                    self._audio_filename(data), full_caption)
+            else:
+                name = self._document_filename(atype, data)
                 return await self._tg_send_file(
                     "sendDocument", "document", file_bytes,
                     name, full_caption)
@@ -312,10 +368,11 @@ class TelegramForwarder:
             logger.debug("Ошибка отправки медиа", exc_info=True)
         return False
 
-    async def _resolve_video_url(self, media: dict, msg: UnifiedMessage) -> str:
-        """Resolve a real video download URL, never the preview thumbnail."""
+    async def _resolve_media_url(self, media: dict, msg: UnifiedMessage) -> str:
+        """Resolve direct or MAX-generated download URL for any supported media."""
+        atype = str(media.get("type") or "")
         url = str(media.get("url") or "")
-        if url:
+        if atype in {"PHOTO", "VIDEO"} and url:
             return url
 
         file_id = media.get("file_id")
@@ -324,23 +381,69 @@ class TelegramForwarder:
             if isinstance(data, dict):
                 file_id = self._extract_file_id(data)
         if not isinstance(file_id, int):
-            return ""
+            return url
 
-        account = self._manager.get(msg.account_id)
-        if account is None or not account.is_connected:
-            return ""
+        if isinstance(file_id, int):
+            account = self._manager.get(msg.account_id)
+            if account is not None and account.is_connected:
+                media_type = "video" if atype == "VIDEO" else "file"
+                try:
+                    resolved = await get_download_url(
+                        account.connection,
+                        msg.chat_id,
+                        msg.message_id,
+                        file_id,
+                        media_type,
+                    )
+                    if resolved:
+                        return resolved
+                except Exception:
+                    logger.debug("Не удалось получить URL вложения MAX", exc_info=True)
 
-        try:
-            return await get_download_url(
-                account.connection,
-                msg.chat_id,
-                msg.message_id,
-                file_id,
-                "video",
-            )
-        except Exception:
-            logger.debug("Не удалось получить URL видео MAX", exc_info=True)
-            return ""
+        return url
+
+    @staticmethod
+    def _has_non_control_attachments(msg: UnifiedMessage) -> bool:
+        attachments = list(msg.attachments)
+        if msg.link_type == "FORWARD" and msg.linked_message is not None:
+            attachments.extend(msg.linked_message.attachments)
+        return any(attachment.get("type") != "CONTROL" for attachment in attachments)
+
+    def _log_unforwardable_attachments(self, msg: UnifiedMessage) -> None:
+        summaries = []
+        for attachment in msg.attachments:
+            summaries.append(self._attachment_summary(attachment))
+        if msg.link_type == "FORWARD" and msg.linked_message is not None:
+            for attachment in msg.linked_message.attachments:
+                summaries.append(f"forward:{self._attachment_summary(attachment)}")
+        logger.warning(
+            "MAX message has attachments but no downloadable file metadata: "
+            "account=%s chat=%s message=%s attachments=%s",
+            msg.account_id,
+            msg.chat_id,
+            msg.message_id or "?",
+            "; ".join(summaries)[:1000],
+        )
+
+    @staticmethod
+    def _attachment_summary(attachment: dict[str, object]) -> str:
+        atype = str(attachment.get("type", "?"))
+        data = attachment.get("data", {})
+        if not isinstance(data, dict):
+            return f"type={atype} keys=-"
+        keys = ",".join(sorted(str(key) for key in data.keys())[:10]) or "-"
+        name = (
+            data.get("fileName")
+            or data.get("name")
+            or data.get("title")
+            or data.get("filename")
+            or "-"
+        )
+        return f"type={atype} name={name} keys={keys}"
+
+    async def _resolve_video_url(self, media: dict, msg: UnifiedMessage) -> str:
+        """Resolve a real video download URL, never the preview thumbnail."""
+        return await self._resolve_media_url(media, msg)
 
     @staticmethod
     def _video_filename(data: dict) -> str:
@@ -349,6 +452,90 @@ class TelegramForwarder:
         if "." not in filename:
             return f"{filename}.mp4"
         return filename
+
+    @staticmethod
+    def _audio_filename(data: dict) -> str:
+        name = data.get("fileName") or data.get("name") or "voice.ogg"
+        filename = str(name)
+        if "." not in filename:
+            return f"{filename}.ogg"
+        return filename
+
+    @staticmethod
+    def _document_filename(atype: str, data: dict) -> str:
+        name = (
+            data.get("fileName")
+            or data.get("name")
+            or data.get("title")
+            or data.get("filename")
+            or atype.lower()
+            or "file"
+        )
+        return str(name)
+
+    def _format_failed_attachments(self, msg: UnifiedMessage,
+                                   failed: list[dict]) -> str:
+        """Short operator-visible notice when only part of a bundle was sent."""
+        lines = self._format_media_caption(msg).splitlines()
+        lines.append(f"⚠️ Не удалось отправить вложения: {len(failed)}")
+        for media in failed[:10]:
+            lines.append(f"• {_esc(self._media_display_name(media))}")
+        return "\n".join(lines)[:_MAX_TEXT]
+
+    def _format_media_caption(self, msg: UnifiedMessage) -> str:
+        """Caption for successfully forwarded files without attachment placeholders."""
+        lines = [self._format_header(msg)]
+        if msg.link_type == "REPLY":
+            lines.extend(self._format_linked_text_block(msg))
+        if msg.text:
+            lines.append(_esc(msg.text))
+        if msg.link_type != "REPLY":
+            lines.extend(self._format_linked_text_block(msg))
+        return "\n".join(lines)[:_MAX_TEXT]
+
+    def _format_linked_text_block(self, msg: UnifiedMessage) -> list[str]:
+        """Render linked message context without attachment placeholder lines."""
+        if not msg.link_type:
+            return []
+        lines = [self._link_label(msg.link_type)]
+        linked = msg.linked_message
+        if linked is not None and linked.text:
+            lines.append(_esc(linked.text))
+        if len(lines) == 1 and linked is None:
+            lines.append("<i>[без содержимого]</i>")
+        return lines
+
+    @staticmethod
+    def _media_display_name(media: dict) -> str:
+        atype = str(media.get("type") or "FILE")
+        data = media.get("data", {})
+        if not isinstance(data, dict):
+            data = {}
+        name = (
+            data.get("fileName")
+            or data.get("name")
+            or data.get("title")
+            or data.get("filename")
+        )
+        return str(name or atype)
+
+    def _log_media_failure(self, reason: str, media: dict,
+                           msg: UnifiedMessage) -> None:
+        data = media.get("data", {})
+        keys = "-"
+        if isinstance(data, dict):
+            keys = ",".join(sorted(str(key) for key in data.keys())[:10]) or "-"
+        logger.warning(
+            "MAX attachment was not forwarded: reason=%s account=%s chat=%s "
+            "message=%s type=%s name=%s keys=%s",
+            reason,
+            msg.account_id,
+            msg.chat_id,
+            msg.message_id or "?",
+            media.get("type", "?"),
+            self._media_display_name(media),
+            keys,
+        )
 
     def _format_body_lines(self, msg: UnifiedMessage) -> list[str]:
         """Render wrapper text, attachments, and linked content into body lines."""
@@ -435,8 +622,9 @@ class TelegramForwarder:
         form = aiohttp.FormData()
         form.add_field("chat_id", self._config.chat_id)
         form.add_field(field, file_bytes, filename=filename)
-        form.add_field("caption", caption)
-        form.add_field("parse_mode", "HTML")
+        if caption:
+            form.add_field("caption", caption)
+            form.add_field("parse_mode", "HTML")
 
         api = _API.format(token=self._config.bot_token, method=method)
         try:

@@ -187,13 +187,44 @@ class TestFormatMessage:
         assert media["type"] == "PHOTO"
         assert media["url"] == "https://x.com/p"
 
-    def test_find_media_none(self):
+    def test_find_media_audio_direct_url(self):
         fw = self._make_forwarder()
         msg = _msg(attachments=[
             {"type": "AUDIO", "data": {"url": "https://x.com/a"}}
         ])
         media = fw._find_media(msg)
-        assert media is None
+        assert media is not None
+        assert media["type"] == "AUDIO"
+        assert media["url"] == "https://x.com/a"
+
+    def test_collect_media_returns_all_attachments(self):
+        fw = self._make_forwarder()
+        msg = _msg(attachments=[
+            {"type": "PHOTO", "data": {"baseUrl": "https://x.com/1.jpg"}},
+            {"type": "PHOTO", "data": {"baseUrl": "https://x.com/2.jpg"}},
+            {"type": "FILE", "data": {"fileId": 77, "fileName": "doc.pdf"}},
+        ])
+
+        media_items = fw._collect_media(msg)
+
+        assert [item["type"] for item in media_items] == ["PHOTO", "PHOTO", "FILE"]
+        assert [item["url"] for item in media_items[:2]] == [
+            "https://x.com/1.jpg", "https://x.com/2.jpg",
+        ]
+        assert media_items[2]["file_id"] == 77
+
+    def test_format_media_caption_omits_attachment_placeholders(self):
+        fw = self._make_forwarder()
+        msg = _msg(text="files", attachments=[
+            {"type": "PHOTO", "data": {"baseUrl": "https://x.com/p.jpg"}},
+            {"type": "FILE", "data": {"fileId": 77, "fileName": "doc.pdf"}},
+        ])
+
+        caption = fw._format_media_caption(msg)
+
+        assert "files" in caption
+        assert "🖼 Фото" not in caption
+        assert "doc.pdf" not in caption
 
     def test_find_media_video_with_file_id(self):
         fw = self._make_forwarder()
@@ -326,6 +357,52 @@ class TestErrorNotifications:
         fw._download.assert_awaited_once_with("https://x.com/download/video.mp4")
         args = fw._tg_send_file.await_args.args
         assert args[:4] == ("sendVideo", "video", b"video-bytes", "clip.mp4")
+
+    @pytest.mark.asyncio
+    async def test_send_media_file_resolves_download_url_by_file_id(self, monkeypatch):
+        fw = self._make_forwarder()
+        account = MagicMock()
+        account.is_connected = True
+        account.connection = MagicMock()
+        fw._manager.get.return_value = account
+        get_download_url = AsyncMock(return_value="https://x.com/download/doc.pdf")
+        monkeypatch.setattr(forwarder_module, "get_download_url", get_download_url)
+        fw._download = AsyncMock(return_value=b"pdf-bytes")
+        fw._tg_send_file = AsyncMock(return_value=True)
+        msg = _msg(message_id="m-file")
+
+        result = await fw._send_media(
+            {"type": "FILE", "url": "", "file_id": 77, "data": {"fileName": "doc.pdf"}},
+            msg,
+        )
+
+        assert result is True
+        get_download_url.assert_awaited_once_with(
+            account.connection, 123, "m-file", 77, "file",
+        )
+        fw._download.assert_awaited_once_with("https://x.com/download/doc.pdf")
+        args = fw._tg_send_file.await_args.args
+        assert args[:4] == ("sendDocument", "document", b"pdf-bytes", "doc.pdf")
+
+    @pytest.mark.asyncio
+    async def test_send_media_items_sends_all_with_caption_only_once(self):
+        fw = self._make_forwarder()
+        fw._send_media = AsyncMock(return_value=True)
+        msg = _msg(text="bundle")
+        media_items = [
+            {"type": "PHOTO", "url": "https://x.com/1.jpg", "data": {}},
+            {"type": "FILE", "url": "", "file_id": 77, "data": {"fileName": "doc.pdf"}},
+        ]
+
+        sent_count, failed = await fw._send_media_items(media_items, msg)
+
+        assert sent_count == 2
+        assert failed == []
+        assert fw._send_media.await_count == 2
+        first_caption = fw._send_media.await_args_list[0].kwargs["caption"]
+        second_caption = fw._send_media.await_args_list[1].kwargs["caption"]
+        assert "bundle" in first_caption
+        assert second_caption == ""
 
     @pytest.mark.asyncio
     async def test_send_alert_uses_send_text(self):

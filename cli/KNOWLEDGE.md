@@ -291,3 +291,12 @@ Update rule:
     - `Пользователь совершил(а) действие в <чат>: звонок`
   - Known events such as join/leave/call/pin are mapped to readable Russian labels.
   - Unknown control events fall back to normalized event names rather than the raw word `CONTROL`.
+
+## [2026-05-17] Telegram Multi-Attachment Forwarding
+- **Decision:** Forward every downloadable MAX attachment to Telegram instead of sending only the first media item and falling back to text placeholders.
+- **Reason:** Operators were seeing placeholder messages such as `📎 UNSUPPORTED`, repeated `🖼 Фото`, or `🎬 Видео (236с)` instead of the actual attached files, especially when a MAX message contained several documents/media items.
+- **Context:**
+  - `TelegramForwarder` now collects all downloadable attachments from the message and forwarded-message payload.
+  - `PHOTO` and direct `VIDEO` URLs are sent directly; `VIDEO`, `FILE`, `AUDIO`, and unknown document-like attachments with a `fileId` use the MAX download API before upload to Telegram.
+  - The original message caption is attached only to the first successfully sent Telegram file to avoid duplicate captions.
+  - If MAX provides attachment metadata without usable URL/file ID, maxBridge logs a warning with sanitized attachment keys so future payload variants can be supported without exposing secrets.
