@@ -300,3 +300,11 @@ Update rule:
   - `PHOTO` and direct `VIDEO` URLs are sent directly; `VIDEO`, `FILE`, `AUDIO`, and unknown document-like attachments with a `fileId` use the MAX download API before upload to Telegram.
   - The original message caption is attached only to the first successfully sent Telegram file to avoid duplicate captions.
   - If MAX provides attachment metadata without usable URL/file ID, maxBridge logs a warning with sanitized attachment keys so future payload variants can be supported without exposing secrets.
+
+## [2026-05-20] MAX Video Download Payload Shape
+- **Decision:** Use `videoId` rather than `fileId` for MAX opcode `83` video downloads and parse format URLs from the response payload.
+- **Reason:** Production video attachments contained `_type=VIDEO`, numeric `videoId`, `token`, `thumbnail`, and no direct video URL. Sending opcode `83` with `fileId` produced no downloadable URL, causing Telegram alerts like `Не удалось отправить вложения: VIDEO`.
+- **Context:**
+  - Confirmed from live IPC history and `vkmax`: `DOWNLOAD_VIDEO` payload is `{chatId, messageId, videoId}`.
+  - `DOWNLOAD_FILE` still uses `{chatId, messageId, fileId}`.
+  - Video download responses can contain format keys instead of `payload.url`; ignore `cache` and `EXTERNAL`, then use the first concrete format URL.

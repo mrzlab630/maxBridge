@@ -87,11 +87,24 @@ async def get_download_url(conn: MaxConnection, chat_id: int,
     if media_type not in ("file", "video"):
         raise ValueError(f"Invalid media_type: {media_type}")
     opcode = Opcode.DOWNLOAD_VIDEO if media_type == "video" else Opcode.DOWNLOAD_FILE
+    id_key = "videoId" if media_type == "video" else "fileId"
     result = await conn.client.invoke_method(
         opcode=opcode,
-        payload={"chatId": chat_id, "messageId": message_id, "fileId": file_id},
+        payload={"chatId": chat_id, "messageId": message_id, id_key: file_id},
     )
-    return result.get("payload", {}).get("url", "")
+    payload = result.get("payload", {})
+    if not isinstance(payload, dict):
+        return ""
+    url = payload.get("url")
+    if isinstance(url, str) and url:
+        return url
+    if media_type == "video":
+        for key, value in payload.items():
+            if key in {"cache", "EXTERNAL"}:
+                continue
+            if isinstance(value, str) and value:
+                return value
+    return ""
 
 
 def _validate_file(file_path: str) -> None:
