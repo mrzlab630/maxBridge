@@ -1,0 +1,66 @@
+# maxBridge — default configuration
+# Copy to config/local.yaml and adjust for your environment
+
+# Multi-account configuration
+# Each key under 'accounts' is an account_id
+accounts:
+  default:
+    phone: "+7XXXXXXXXXX"
+    session_file: "data/default.session"
+    reconnect_delay: 5
+    reconnect_max_retries: 10
+
+  # Example second account (uncomment to use):
+  # work:
+  #   phone: "+7YYYYYYYYY"
+  #   session_file: "data/work.session"
+  #   reconnect_delay: 5
+  #   reconnect_max_retries: 10
+
+# Encryption settings
+security:
+  # Master key file for session token encryption (auto-generated)
+  key_file: "data/master.key"
+
+max_client:
+  # Unofficial MAX user-account WebSocket surface.
+  # Keep defaults unless a fresh research pass confirms a protocol move.
+  ws_host: "wss://ws-api.oneme.ru/websocket"
+  ws_origin: "https://web.max.ru"
+  user_agent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+  rpc_version: 11
+  app_version: "26.2.2"
+  keepalive_interval: 30
+  keepalive_timeout: 15
+  hello:
+    device_type: "WEB"
+    locale: "ru_RU"
+    device_locale: "ru-RU"
+    os_version: "Linux"
+    device_name: "maxBridge"
+    screen: "1920x1080 1.0x"
+    timezone: "Europe/Moscow"
+
+ipc:
+  transport: "unix"
+  # unix_socket: auto-detected via XDG_RUNTIME_DIR
+  tcp_host: "127.0.0.1"
+  tcp_port: 9100
+  max_clients: 10
+  # auth_secret: null  # Set to enable IPC auth (generate: maxbridge --generate-token)
+  # allow_remote_tcp: false  # Required to bind TCP to non-loopback
+  # rate_limits:
+  #   send_message: {rate: 5, burst: 10}
+  #   default: {rate: 30, burst: 60}
+
+bridge:
+  listen_chats: "all"
+  cache_ttl: 600  # Entity cache TTL in seconds
+
+logging:
+  level: "INFO"
+  file: null
+  format: "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+
+daemon:
+  pid_file: "/tmp/maxbridge.pid"

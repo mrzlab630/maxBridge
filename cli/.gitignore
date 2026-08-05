@@ -29,7 +29,7 @@ env/
 .env
 *.log
 config/local.yaml
-data/
+/data/
 *.session
 *.key
 max_session.txt
