@@ -169,11 +169,13 @@ maxBridge использует **QR-код авторизацию**:
 ```json
 {
   "enabled": true,
-  "bot_token": "123456:ABC-DEF...",
-  "chat_id": "-1001234567890",
-  "allowed_chat_ids": ["-1001234567890", "145185443"]
+  "bot_token": "000000000:EXAMPLE_TOKEN_REPLACE_ME",
+  "chat_id": "-1000000000001",
+  "allowed_chat_ids": ["-1000000000001", "1000000001"]
 }
 ```
+
+Все значения в примере фиктивные. Замените токен, ID получателя и список разрешённых чатов своими значениями.
 
 `allowed_chat_ids` ограничивает, из каких Telegram чатов разрешены управляющие команды. Если поле не задано, по умолчанию используется `chat_id`.
 
@@ -280,6 +282,60 @@ socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/maxbridge.sock
 
 ## Деплой
 
+### PM2
+
+PM2 запускает демон `maxbridge` из локального virtualenv и автоматически перезапускает его после сбоя. TUI через PM2 не запускается.
+
+```bash
+cd maxBridge/cli
+source .venv/bin/activate
+pip install -e ".[dev]"
+
+# PM2 устанавливается один раз
+npm install -g pm2
+
+# Каталог для stdout/stderr из ecosystem.config.cjs
+mkdir -p logs
+
+# Первый запуск демона
+npm run pm2:prod
+
+# Проверка состояния и просмотр логов
+npm run pm2:status
+npm run pm2:logs
+```
+
+Управление процессом:
+
+```bash
+# Перезапустить после изменения конфига или кода
+npm run pm2:restart
+
+# Удалить процесс из PM2
+npm run pm2:delete
+```
+
+Чтобы восстановить процесс после перезагрузки сервера:
+
+```bash
+pm2 startup
+# Выполните команду с sudo, которую напечатает PM2
+npm run pm2:save
+```
+
+Обновление приложения:
+
+```bash
+cd maxBridge/cli
+git pull
+source .venv/bin/activate
+pip install -e ".[dev]"
+npm run pm2:restart
+npm run pm2:save
+```
+
+PM2 пишет логи в `logs/maxbridge-out.log` и `logs/maxbridge-error.log`.
+
 ### systemd
 
 ```bash
@@ -311,7 +367,7 @@ cd maxBridge/cli && source .venv/bin/activate
 python -m pytest tests/ -v
 ```
 
-Сейчас в проекте 187 unit-тестов.
+Сейчас в проекте 189 unit-тестов.
 
 ## Лицензия
 

@@ -53,8 +53,8 @@ class TestTelegramControlBot:
         bot._config = TelegramConfig(
             enabled=True,
             bot_token="123:ABC",
-            chat_id="-100123",
-            allowed_chat_ids=["-100123", "145185443"],
+            chat_id="-1000000000001",
+            allowed_chat_ids=["-1000000000001", "1000000001"],
         )
         bot.set_status_provider(lambda: {
             "daemon": {"running": True, "shutdown_requested": False},
@@ -78,7 +78,7 @@ class TestTelegramControlBot:
         bot._start_auth_task = MagicMock(return_value=True)
 
         await bot._handle_message({
-            "chat": {"id": -100123},
+            "chat": {"id": -1000000000001},
             "text": "/auth@msgMaxBridge_bot",
         })
 
@@ -86,7 +86,7 @@ class TestTelegramControlBot:
             "default",
             "Manual Telegram /auth request",
             requested_by="manual",
-            target_chat_id="-100123",
+            target_chat_id="-1000000000001",
         )
         bot._send_message.assert_awaited_once()
 
@@ -110,12 +110,12 @@ class TestTelegramControlBot:
         bot._send_message = AsyncMock()
 
         await bot._handle_message({
-            "chat": {"id": 145185443},
+            "chat": {"id": 1000000001},
             "text": "/status",
         })
 
         bot._send_message.assert_awaited_once()
-        assert bot._send_message.await_args.kwargs["chat_id"] == "145185443"
+        assert bot._send_message.await_args.kwargs["chat_id"] == "1000000001"
 
     @pytest.mark.asyncio
     async def test_update_command_sends_runtime_summary(self):
@@ -123,7 +123,7 @@ class TestTelegramControlBot:
         bot._send_message = AsyncMock()
 
         await bot._handle_message({
-            "chat": {"id": -100123},
+            "chat": {"id": -1000000000001},
             "text": "/update",
         })
 
@@ -139,7 +139,7 @@ class TestTelegramControlBot:
         bot._send_message = AsyncMock()
 
         await bot._handle_message({
-            "chat": {"id": -100123},
+            "chat": {"id": -1000000000001},
             "text": "/status@msgMaxBridge_bot",
         })
 
@@ -176,7 +176,7 @@ class TestTelegramControlBot:
     async def test_non_command_message_fulfills_pending_secret_prompt(self):
         bot, _manager = self._make_bot()
         future = asyncio.get_running_loop().create_future()
-        bot._pending_secret_prompts["145185443"] = _PendingSecretPrompt(
+        bot._pending_secret_prompts["1000000001"] = _PendingSecretPrompt(
             future=future,
             account_id="default",
             prompt_message_id=11,
@@ -184,7 +184,7 @@ class TestTelegramControlBot:
         )
 
         await bot._handle_message({
-            "chat": {"id": 145185443},
+            "chat": {"id": 1000000001},
             "message_id": 77,
             "text": "secret-password",
         })
@@ -205,7 +205,7 @@ class TestTelegramControlBot:
             "default",
             "https://example.com/qr",
             "Manual Telegram /auth request",
-            chat_id="145185443",
+            chat_id="1000000001",
         )
 
         assert response == {"result": {"message_id": 5}}
@@ -223,7 +223,7 @@ class TestTelegramControlBot:
             "default",
             "https://example.com/qr",
             "Manual Telegram /auth request",
-            chat_id="145185443",
+            chat_id="1000000001",
         )
 
         assert response == {"result": {"message_id": 6}}

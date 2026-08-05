@@ -38,13 +38,13 @@ class TelegramScreen(Screen):
             yield Label("Токен бота:")
             yield Input(
                 value=self._config.bot_token,
-                placeholder="123456:ABC-DEF...",
+                placeholder="000000000:EXAMPLE_TOKEN",
                 password=True,
                 id="tg-token")
             yield Label("ID получателя:")
             yield Input(
                 value=self._config.chat_id,
-                placeholder="-1001234567890 или @channel",
+                placeholder="-1000000000001 или @channel",
                 id="tg-chat-id")
             yield OptionList(
                 Option(self._toggle_label(), id="toggle"),
