@@ -166,6 +166,16 @@ Update rule:
     - attempts to delete the entered password message and the prompt after use
     - refuses secret input in channel chats and instructs the operator to continue in DM
 
+## [2026-08-05] TUI QR Login Handles MAX Password Challenge
+- **Decision:** Route TUI QR completion through the shared auth flow and treat `passwordChallenge` as an interactive second step.
+- **Reason:** The TUI previously extracted the login token directly, swallowed the resulting password-challenge exception, and returned to the sessions screen without explaining the failure.
+- **Behavior:**
+  - after QR scan, the TUI replaces the QR with a masked MAX password field
+  - the password is submitted through opcode `115` and is never logged
+  - the session is saved only after MAX returns a login token
+  - QR expiry, password rejection, and other completion failures remain visible until the operator dismisses the screen
+  - the password prompt and final error fit in a standard `80x24` terminal
+
 ## [2026-04-21] Best External References For Future Updates
 - **Decision:** Refresh these sources first before doing any new deep research.
 - **Reason:** They are the highest-signal public sources found during the `2026-04-21` research pass.

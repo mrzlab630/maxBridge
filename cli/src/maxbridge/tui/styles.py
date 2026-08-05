@@ -49,11 +49,12 @@ Footer > .footer--key { background: #2a1a4e; color: #ff00ff; }
 }
 
 #qr-box {
-    width: 80; height: auto; border: heavy #ff00ff;
-    background: #0d0d1a; padding: 1 2; margin: 2 4;
+    width: 90%; max-width: 80; height: auto; border: heavy #ff00ff;
+    background: #0d0d1a; padding: 1 2; margin: 1 2;
 }
 #qr-log { height: auto; max-height: 25; background: #0a0a12; }
 #qr-status-label { text-align: center; color: #00ffcc; margin-top: 1; }
+#qr-password { display: none; margin-top: 1; }
 
 #detail-profile { height: 1fr; border: solid #00ffcc; background: #0d0d1a; padding: 1; }
 #detail-actions { height: auto; margin-top: 1; }
