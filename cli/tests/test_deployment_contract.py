@@ -9,6 +9,7 @@ import subprocess
 CLI_ROOT = pathlib.Path(__file__).resolve().parents[1]
 REPO_ROOT = CLI_ROOT.parent
 INSTALLER = CLI_ROOT / "deploy/install.sh"
+TUI_BUILDER = CLI_ROOT / "deploy/build-tui.sh"
 
 
 def _installer_text() -> str:
@@ -89,6 +90,71 @@ def test_installer_creates_and_preserves_local_state_from_arbitrary_cwd(tmp_path
         text=True,
     )
     assert config.read_text(encoding="utf-8") == "marker: operator\n"
+
+
+def test_tui_builder_builds_and_installs_one_checkout_local_wheel_from_arbitrary_cwd(tmp_path):
+    checkout = tmp_path / "checkout" / "cli"
+    (checkout / "deploy").mkdir(parents=True)
+    shutil.copy2(TUI_BUILDER, checkout / "deploy/build-tui.sh")
+    (checkout / "dist").mkdir()
+    (checkout / "dist/maxbridge-stale.whl").write_text("stale\n", encoding="utf-8")
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_python = fake_bin / "python3"
+    fake_python.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = \"-m\" ] && [ \"$2\" = \"venv\" ]; then\n"
+        "    mkdir -p .venv/bin\n"
+        "    cp \"$0\" .venv/bin/python\n"
+        "else\n"
+        "    printf '%s\\n' \"$*\" >> pip-calls\n"
+        "    if [ \"$3\" = \"wheel\" ]; then\n"
+        "        mkdir -p dist\n"
+        "        : > dist/maxbridge-0.1.7-py3-none-any.whl\n"
+        "    fi\n"
+        "    if [ \"$3\" = \"install\" ]; then\n"
+        "        printf '#!/bin/sh\\ntouch tui-started\\n' > .venv/bin/maxbridge-tui\n"
+        "        chmod +x .venv/bin/maxbridge-tui\n"
+        "    fi\n"
+        "fi\n",
+        encoding="utf-8",
+    )
+    fake_python.chmod(fake_python.stat().st_mode | stat.S_IXUSR)
+    env = {**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}"}
+
+    result = subprocess.run(
+        ["bash", str(checkout / "deploy/build-tui.sh")],
+        cwd=tmp_path,
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    wheel = checkout / "dist/maxbridge-0.1.7-py3-none-any.whl"
+    tui = checkout / ".venv/bin/maxbridge-tui"
+    assert not (checkout / "dist/maxbridge-stale.whl").exists()
+    assert (checkout / "pip-calls").read_text(encoding="utf-8").splitlines() == [
+        "-m pip wheel --no-deps --wheel-dir dist .",
+        f"-m pip install --force-reinstall --no-deps {wheel}",
+    ]
+    assert tui.is_file() and os.access(tui, os.X_OK)
+    assert f"Wheel: {wheel}" in result.stdout
+    assert f"TUI:   {tui}" in result.stdout
+    assert "maxbridge-tui" not in (checkout / "pip-calls").read_text(encoding="utf-8")
+    assert not (checkout / "tui-started").exists()
+
+
+def test_tui_builder_is_local_only_and_noninteractive():
+    builder = TUI_BUILDER.read_text(encoding="utf-8")
+
+    assert 'CLI_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"' in builder
+    assert 'cd "$CLI_ROOT"' in builder
+    assert ".venv/bin/python -m pip wheel --no-deps --wheel-dir dist ." in builder
+    assert ".venv/bin/python -m pip install --force-reinstall --no-deps \"$WHEEL_PATH\"" in builder
+    for forbidden in ("useradd", "/etc/", "/usr/local", "/var/lib", "systemctl", "sudo"):
+        assert forbidden not in builder
 
 
 def test_systemd_application_pid_contract_is_consistent():
