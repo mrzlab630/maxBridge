@@ -11,6 +11,25 @@ from typing import Any
 
 import yaml
 
+_SYSTEM_CONFIG_PATH = Path("/etc/maxbridge/config.yaml")
+_SYSTEM_STATE_ROOT = Path("/var/lib/maxbridge")
+
+
+class ResolvedConfig(dict[str, Any]):
+    """Configuration values plus the canonical source and runtime paths."""
+
+    def __init__(
+        self,
+        values: dict[str, Any],
+        *,
+        source_path: Path | None,
+        runtime_root: Path,
+    ) -> None:
+        super().__init__(values)
+        self.source_path = source_path
+        self.runtime_root = runtime_root
+        self.telegram_config_path = runtime_root / "data" / "telegram.json"
+
 
 def _deep_merge(base: dict, override: dict) -> dict:
     """Recursively merge override into base, returning a new dict."""
@@ -43,21 +62,50 @@ def _find_local_config() -> Path | None:
     return None
 
 
-def load_config(config_path: str | None = None) -> dict[str, Any]:
+def _canonical_path(path: str | os.PathLike[str]) -> Path:
+    return Path(os.path.abspath(Path(path).expanduser()))
+
+
+def resolve_config_path(
+    config_path: str | os.PathLike[str] | None = None,
+) -> Path | None:
+    """Return the canonical explicit or discovered primary config path."""
+    selected = Path(config_path) if config_path is not None else _find_local_config()
+    return _canonical_path(selected) if selected is not None else None
+
+
+def runtime_root_for_config(config_path: Path | None) -> Path:
+    """Map a primary config path to its deterministic writable state root."""
+    if config_path is None:
+        return _canonical_path(Path.cwd())
+    if config_path == _SYSTEM_CONFIG_PATH:
+        return _SYSTEM_STATE_ROOT
+    if config_path.name == "local.yaml" and config_path.parent.name == "config":
+        return config_path.parent.parent
+    return config_path.parent
+
+
+def load_config(
+    config_path: str | os.PathLike[str] | None = None,
+) -> ResolvedConfig:
     """Load configuration from YAML files.
 
     Priority: CLI arg > local config > embedded default > env vars.
     """
     config = _load_default_config()
 
-    local_path = Path(config_path) if config_path else _find_local_config()
+    local_path = resolve_config_path(config_path)
     if local_path and local_path.exists():
         with open(local_path, "r", encoding="utf-8") as f:
             local = yaml.safe_load(f) or {}
         config = _deep_merge(config, local)
 
     _apply_env_overrides(config)
-    return config
+    return ResolvedConfig(
+        config,
+        source_path=local_path,
+        runtime_root=runtime_root_for_config(local_path),
+    )
 
 
 _ALLOWED_ENV_OVERRIDES = {

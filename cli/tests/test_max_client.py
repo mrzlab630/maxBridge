@@ -5,8 +5,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from maxbridge.protocol.max_client import MaxClient
 from maxbridge.protocol.errors import MaxConnectionError
+from maxbridge.protocol.max_client import MaxClient
 
 
 class _DummyConnection:

@@ -14,19 +14,22 @@ from maxbridge.bridge.event_bus import EventBus
 from maxbridge.cache.entity_cache import EntityCache
 from maxbridge.client.account_manager import AccountManager
 from maxbridge.client.event_router import EventRouter
-from maxbridge.config import get_nested, load_config
+from maxbridge.config import ResolvedConfig, get_nested, load_config
 from maxbridge.handlers.attachment import create_upload_complete_handler
 from maxbridge.handlers.message import create_message_handler
 from maxbridge.ipc.methods import RpcMethods
 from maxbridge.ipc.server import IpcServer
 from maxbridge.ipc.stats import StatsCollector, StatsLogHandler
 from maxbridge.protocol.errors import MaxApiError, MaxConnectionError
+from maxbridge.telegram.config import load_telegram_config_snapshot, telegram_config_path
 from maxbridge.telegram.control_bot import TelegramControlBot
 from maxbridge.telegram.forwarder import TelegramForwarder
 from maxbridge.utils.constants import Opcode
 from maxbridge.utils.logger import setup_logging
 
 logger = logging.getLogger("maxbridge.main")
+
+_TELEGRAM_CONFIG_POLL_SECONDS = 1.0
 
 
 async def _drain_background_tasks(
@@ -98,6 +101,8 @@ class MaxBridgeDaemon:
     """Main daemon: multi-account, entity cache, stats, IPC server."""
 
     def __init__(self, config: dict) -> None:
+        if not isinstance(config, ResolvedConfig):
+            raise RuntimeError("MaxBridgeDaemon requires resolved configuration paths")
         self._config = config
         self._shutdown_event = asyncio.Event()
         self._pid_fd: int | None = None
@@ -105,6 +110,7 @@ class MaxBridgeDaemon:
         self._pid_path: Path | None = None
         self._telegram_error_handler: logging.Handler | None = None
         self._stats_error_handler: logging.Handler | None = None
+        self._telegram_watch_task: asyncio.Task | None = None
 
         key_path = get_nested(config, "security.key_file", "data/master.key")
         self._encryptor = TokenEncryptor(key_path)
@@ -126,7 +132,12 @@ class MaxBridgeDaemon:
             config=config.get("ipc", {}),
             stats=self._stats,
         )
-        self._telegram = TelegramForwarder(self._event_bus, self._manager)
+        self._telegram_config_path = telegram_config_path(config.telegram_config_path)
+        self._telegram = TelegramForwarder(
+            self._event_bus,
+            self._manager,
+            config_path=self._telegram_config_path,
+        )
         self._control_bot = TelegramControlBot(self._manager, self._stats)
         self._control_bot.set_status_provider(self._runtime_status)
         self._manager.set_on_auth_required(self._control_bot.request_auth_nowait)
@@ -142,6 +153,7 @@ class MaxBridgeDaemon:
         await self._telegram.start()
         await self._control_bot.start()
         self._attach_error_notifications()
+        self._start_telegram_config_watch()
 
         listen_chats = get_nested(self._config, "bridge.listen_chats", "all")
         for account_id in self._manager.account_ids:
@@ -174,6 +186,7 @@ class MaxBridgeDaemon:
 
     async def stop(self) -> None:
         logger.info("Shutting down maxBridge...")
+        await self._stop_telegram_config_watch()
         await self._control_bot.stop()
         await self._telegram.stop()
         await self._ipc_server.stop()
@@ -248,22 +261,70 @@ class MaxBridgeDaemon:
         self._shutdown_event.set()
 
     def _attach_error_notifications(self) -> None:
-        if self._telegram_error_handler is not None or self._stats_error_handler is not None:
-            return
-
         root = logging.getLogger("maxbridge")
         fmt = get_nested(
             self._config,
             "logging.format",
             "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         )
-        if self._telegram.is_ready:
+        self._sync_telegram_error_handler(fmt)
+
+        if self._stats_error_handler is None:
+            self._stats_error_handler = StatsLogHandler(self._stats)
+            self._stats_error_handler.setFormatter(logging.Formatter(fmt))
+            root.addHandler(self._stats_error_handler)
+
+    def _sync_telegram_error_handler(self, fmt: str | None = None) -> None:
+        root = logging.getLogger("maxbridge")
+        if self._telegram.is_ready and self._telegram_error_handler is None:
+            if fmt is None:
+                fmt = get_nested(
+                    self._config,
+                    "logging.format",
+                    "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+                )
             self._telegram_error_handler = self._telegram.make_log_handler(fmt)
             root.addHandler(self._telegram_error_handler)
+        elif not self._telegram.is_ready and self._telegram_error_handler is not None:
+            root.removeHandler(self._telegram_error_handler)
+            self._telegram_error_handler = None
 
-        self._stats_error_handler = StatsLogHandler(self._stats)
-        self._stats_error_handler.setFormatter(logging.Formatter(fmt))
-        root.addHandler(self._stats_error_handler)
+    def _start_telegram_config_watch(self) -> None:
+        if self._telegram_watch_task is None or self._telegram_watch_task.done():
+            self._telegram_watch_task = asyncio.create_task(
+                self._watch_telegram_config(),
+                name="telegram-config-watch",
+            )
+
+    async def _stop_telegram_config_watch(self) -> None:
+        task = self._telegram_watch_task
+        self._telegram_watch_task = None
+        if task is None:
+            return
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    async def _reload_telegram_config_if_changed(self) -> bool:
+        snapshot = load_telegram_config_snapshot(self._telegram_config_path)
+        if snapshot.fingerprint == self._telegram.observed_fingerprint:
+            return False
+        changed = await self._telegram.reload(snapshot)
+        if changed:
+            self._sync_telegram_error_handler()
+        return changed
+
+    async def _watch_telegram_config(self) -> None:
+        while True:
+            try:
+                await asyncio.sleep(_TELEGRAM_CONFIG_POLL_SECONDS)
+                await self._reload_telegram_config_if_changed()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "Telegram config watcher failed; keeping current state: %s",
+                    type(exc).__name__,
+                )
 
     def _detach_error_notifications(self) -> None:
         root = logging.getLogger("maxbridge")
@@ -313,6 +374,7 @@ def cli_entry() -> None:
         return
 
     config = load_config(args.config)
+    os.chdir(getattr(config, "runtime_root", Path.cwd()))
 
     # --debug overrides config logging level
     log_level = "DEBUG" if args.debug else get_nested(config, "logging.level", "WARNING")

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "maxbridge"
-version = "0.1.9"
+version = "0.1.10"
 description = "MAX Messenger bridge daemon — receive and forward messages via JSON-RPC IPC"
 requires-python = ">=3.10"
 license = {text = "MIT"}
@@ -46,3 +46,4 @@ select = ["E", "F", "W", "I"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+pythonpath = ["src"]

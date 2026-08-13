@@ -22,8 +22,24 @@ from maxbridge.tui.screens import ChatListScreen, SessionScreen
 from maxbridge.tui.styles import CYBERPUNK_CSS, LOGO
 
 
+def _runtime_root() -> Path:
+    """Locate the checkout-local cli root from the installed package or entrypoint."""
+    starts = (Path(__file__).resolve(), Path(sys.executable).resolve(), Path.cwd().resolve())
+    for start in starts:
+        for candidate in (start, *start.parents):
+            if (candidate / "pyproject.toml").is_file() and (
+                candidate / "src/maxbridge"
+            ).is_dir():
+                return candidate
+    return Path.cwd().resolve()
+
+
+def _local_config_path() -> Path:
+    return _runtime_root() / "config/local.yaml"
+
+
 def _daemon_log_path() -> Path:
-    return Path("logs/maxbridge-tui-daemon.log")
+    return _runtime_root() / "logs/maxbridge-tui-daemon.log"
 
 
 def _open_daemon_log():
@@ -161,8 +177,18 @@ class MaxBridgeTUI(App):
                 return
             try:
                 subprocess.Popen(
-                    [sys.executable, "-m", "maxbridge.main"],
-                    stdout=daemon_log, stderr=daemon_log, start_new_session=True)
+                    [
+                        sys.executable,
+                        "-m",
+                        "maxbridge.main",
+                        "-c",
+                        str(_local_config_path()),
+                    ],
+                    cwd=_runtime_root(),
+                    stdout=daemon_log,
+                    stderr=daemon_log,
+                    start_new_session=True,
+                )
             finally:
                 daemon_log.close()
             self.notify("🚀 Запуск демона...")
@@ -237,6 +263,7 @@ class MaxBridgeTUI(App):
 
 
 def tui_entry() -> None:
+    os.chdir(_runtime_root())
     app = MaxBridgeTUI()
     app.run()
 

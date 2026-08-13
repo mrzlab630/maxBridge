@@ -64,7 +64,11 @@ def create_upload_complete_handler(
                 account_id=account_id,
                 detail=f"missing chatId; {diagnostic}",
             )
-            logger.warning("[%s] Attachment notification missing chat id: %s", account_id, diagnostic)
+            logger.warning(
+                "[%s] Attachment notification missing chat id: %s",
+                account_id,
+                diagnostic,
+            )
             return
 
         if not chat_filter(chat_id):

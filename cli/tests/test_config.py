@@ -1,6 +1,14 @@
 """Tests for configuration loading."""
 
-from maxbridge.config import _apply_env_overrides, _deep_merge, get_nested, load_config
+from pathlib import Path
+
+from maxbridge.config import (
+    _apply_env_overrides,
+    _deep_merge,
+    get_nested,
+    load_config,
+    runtime_root_for_config,
+)
 
 
 class TestDeepMerge:
@@ -36,6 +44,40 @@ class TestLoadConfig:
         assert "accounts" in cfg or "max" in cfg
         assert "ipc" in cfg
         assert "logging" in cfg
+
+    def test_checkout_config_resolves_stable_checkout_state_root(
+        self, tmp_path, monkeypatch
+    ):
+        checkout = tmp_path / "checkout" / "cli"
+        config_path = checkout / "config" / "local.yaml"
+        config_path.parent.mkdir(parents=True)
+        config_path.write_text("logging:\n  level: DEBUG\n", encoding="utf-8")
+        monkeypatch.chdir(tmp_path)
+
+        cfg = load_config(config_path.relative_to(tmp_path))
+        monkeypatch.chdir(tmp_path.parent)
+
+        assert cfg.source_path == config_path
+        assert cfg.runtime_root == checkout
+        assert cfg.telegram_config_path == checkout / "data" / "telegram.json"
+        assert cfg["logging"]["level"] == "DEBUG"
+
+    def test_discovered_checkout_config_uses_same_state_root(self, tmp_path, monkeypatch):
+        config_path = tmp_path / "config" / "local.yaml"
+        config_path.parent.mkdir()
+        config_path.write_text("{}\n", encoding="utf-8")
+        monkeypatch.chdir(tmp_path)
+
+        cfg = load_config()
+
+        assert cfg.source_path == config_path
+        assert cfg.runtime_root == tmp_path
+        assert cfg.telegram_config_path == tmp_path / "data" / "telegram.json"
+
+    def test_system_config_uses_systemd_state_directory(self):
+        assert runtime_root_for_config(Path("/etc/maxbridge/config.yaml")) == Path(
+            "/var/lib/maxbridge"
+        )
 
 
 class TestEnvironmentOverrides:

@@ -5,7 +5,13 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from maxbridge.bridge.event_bus import EventBus
 from maxbridge.telegram import forwarder as forwarder_module
+from maxbridge.telegram.config import (
+    TelegramConfig,
+    load_telegram_config_snapshot,
+    save_telegram_config,
+)
 from maxbridge.telegram.forwarder import TelegramForwarder, TelegramLogHandler, _esc
 from maxbridge.utils.types import LinkedMessage, MessageStatus, UnifiedMessage
 
@@ -27,6 +33,133 @@ def _msg(text="hi", sender_name="Иван", chat_name="Общий", message_id="
         link_chat_id=link_chat_id,
         linked_message=linked_message,
     )
+
+
+class _FakeClientSession:
+    instances = []
+
+    def __init__(self, **_kwargs):
+        self.closed = False
+        self.close_count = 0
+        self.instances.append(self)
+
+    async def close(self):
+        self.closed = True
+        self.close_count += 1
+
+
+def _forwarder(tmp_path, monkeypatch, config: TelegramConfig):
+    _FakeClientSession.instances = []
+    monkeypatch.setattr(forwarder_module.aiohttp, "ClientSession", _FakeClientSession)
+    path = tmp_path / "telegram.json"
+    save_telegram_config(config, path)
+    bus = EventBus()
+    manager = MagicMock()
+    manager.account_ids = ["default"]
+    return TelegramForwarder(bus, manager, path), bus, path
+
+
+class TestLiveReload:
+    @pytest.mark.asyncio
+    async def test_repeated_valid_reload_keeps_one_subscriber_and_session(
+        self, tmp_path, monkeypatch
+    ):
+        fw, bus, path = _forwarder(
+            tmp_path,
+            monkeypatch,
+            TelegramConfig(enabled=True, bot_token="token", chat_id="chat"),
+        )
+        await fw.start()
+        session = _FakeClientSession.instances[0]
+
+        changed = await fw.reload(load_telegram_config_snapshot(path))
+
+        assert changed is False
+        assert fw.is_ready
+        assert bus.subscriber_count == 1
+        assert _FakeClientSession.instances == [session]
+        assert session.close_count == 0
+        await fw.stop()
+
+    @pytest.mark.asyncio
+    async def test_changed_ready_config_reuses_one_session_and_subscriber(
+        self, tmp_path, monkeypatch
+    ):
+        fw, bus, path = _forwarder(
+            tmp_path,
+            monkeypatch,
+            TelegramConfig(enabled=True, bot_token="old-token", chat_id="old-chat"),
+        )
+        await fw.start()
+        session = _FakeClientSession.instances[0]
+
+        save_telegram_config(
+            TelegramConfig(enabled=True, bot_token="new-token", chat_id="new-chat"),
+            path,
+        )
+        changed = await fw.reload(load_telegram_config_snapshot(path))
+
+        assert changed is True
+        assert fw.is_ready
+        assert bus.subscriber_count == 1
+        assert _FakeClientSession.instances == [session]
+        assert session.close_count == 0
+        assert fw._config is not None
+        assert fw._config.bot_token == "new-token"
+        assert fw._config.chat_id == "new-chat"
+        await fw.stop()
+
+    @pytest.mark.asyncio
+    async def test_malformed_and_missing_config_keep_last_known_good_without_spinning(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        fw, bus, path = _forwarder(
+            tmp_path,
+            monkeypatch,
+            TelegramConfig(enabled=True, bot_token="super-secret", chat_id="chat"),
+        )
+        await fw.start()
+        session = _FakeClientSession.instances[0]
+        caplog.set_level(logging.WARNING, logger="maxbridge.telegram.forwarder")
+
+        path.write_text('{"bot_token": "super-secret",', encoding="utf-8")
+        malformed = load_telegram_config_snapshot(path)
+        assert await fw.reload(malformed) is False
+        assert await fw.reload(malformed) is False
+        path.unlink()
+        missing = load_telegram_config_snapshot(path)
+        assert await fw.reload(missing) is False
+        assert await fw.reload(missing) is False
+
+        assert fw.is_ready
+        assert bus.subscriber_count == 1
+        assert session.close_count == 0
+        assert _FakeClientSession.instances == [session]
+        assert caplog.text.count("keeping last-known-good state") == 2
+        assert "super-secret" not in caplog.text
+        await fw.stop()
+
+    @pytest.mark.asyncio
+    async def test_valid_disable_closes_session_and_unsubscribes(self, tmp_path, monkeypatch):
+        fw, bus, path = _forwarder(
+            tmp_path,
+            monkeypatch,
+            TelegramConfig(enabled=True, bot_token="token", chat_id="chat"),
+        )
+        await fw.start()
+        session = _FakeClientSession.instances[0]
+        fw._send_text = AsyncMock(return_value=True)
+
+        save_telegram_config(TelegramConfig(enabled=False), path)
+        assert await fw.reload(load_telegram_config_snapshot(path)) is True
+        await bus.publish(_msg(text="must not forward"))
+
+        assert not fw.is_ready
+        assert bus.subscriber_count == 0
+        assert session.closed
+        assert session.close_count == 1
+        fw._send_text.assert_not_awaited()
+        await fw.stop()
 
 
 class TestEscapeHtml:

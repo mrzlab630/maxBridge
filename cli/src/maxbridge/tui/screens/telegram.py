@@ -15,6 +15,11 @@ from maxbridge.telegram.config import (
 )
 from maxbridge.tui.styles import CYBERPUNK_CSS
 
+_DIRECT_TEST_LABEL = "🧪 Тест Bot API"
+_DIRECT_TEST_SCOPE = (
+    "[dim]Только прямая проверка Bot API; готовность форвардинга демона не проверяется.[/dim]"
+)
+
 
 class TelegramScreen(Screen):
     """Настройки Telegram оповещений."""
@@ -49,7 +54,7 @@ class TelegramScreen(Screen):
             yield OptionList(
                 Option(self._toggle_label(), id="toggle"),
                 Option("💾 Сохранить", id="save"),
-                Option("🧪 Тест", id="test"),
+                Option(_DIRECT_TEST_LABEL, id="test"),
                 id="tg-actions",
             )
             yield RichLog(id="tg-log", wrap=True, markup=True)
@@ -94,7 +99,8 @@ class TelegramScreen(Screen):
         if not token or not chat_id:
             self._log("[red]❌ Укажите токен и ID получателя[/red]")
             return
-        self._log("🧪 Отправка тестового сообщения...")
+        self._log(_DIRECT_TEST_SCOPE)
+        self._log("🧪 Отправка прямого тестового сообщения через Bot API...")
         url = f"https://api.telegram.org/bot{token}/sendMessage"
         payload = {
             "chat_id": chat_id,
@@ -107,13 +113,16 @@ class TelegramScreen(Screen):
             ) as session:
                 async with session.post(url, json=payload) as resp:
                     if resp.status == 200:
-                        self._log("[green]✅ Тест успешен![/green]")
+                        self._log(
+                            "[green]✅ Bot API доступен. Это не подтверждает готовность "
+                            "форвардинга демона.[/green]"
+                        )
                     else:
                         body = await resp.text()
                         self._log(f"[red]❌ Ошибка {resp.status}: "
                                   f"{body[:100]}[/red]")
-        except Exception as e:
-            self._log(f"[red]❌ {e}[/red]")
+        except Exception as exc:
+            self._log(f"[red]❌ Ошибка Bot API: {type(exc).__name__}[/red]")
 
     def _log(self, text: str) -> None:
         try:

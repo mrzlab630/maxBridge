@@ -2,13 +2,19 @@
 
 import asyncio
 import logging
+from pathlib import Path
 
 import aiohttp
 
 from maxbridge.bridge.event_bus import EventBus
 from maxbridge.client.account_manager import AccountManager
 from maxbridge.media.uploader import get_download_url
-from maxbridge.telegram.config import TelegramConfig, load_telegram_config
+from maxbridge.telegram.config import (
+    TelegramConfig,
+    TelegramConfigSnapshot,
+    load_telegram_config_snapshot,
+    telegram_config_path,
+)
 from maxbridge.utils.types import MessageStatus, UnifiedMessage
 
 logger = logging.getLogger("maxbridge.telegram.forwarder")
@@ -44,44 +50,104 @@ class TelegramForwarder:
     """Подписчик EventBus — пересылает сообщения в Telegram."""
 
     def __init__(self, event_bus: EventBus,
-                 account_manager: AccountManager) -> None:
+                 account_manager: AccountManager,
+                 config_path: str | Path = "data/telegram.json") -> None:
         self._bus = event_bus
         self._manager = account_manager
+        self._config_path = telegram_config_path(config_path)
         self._config: TelegramConfig | None = None
         self._http: aiohttp.ClientSession | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._observed_fingerprint: str | None = None
+        self._reload_lock = asyncio.Lock()
         self._multi = len(account_manager.account_ids) > 1
 
     async def start(self) -> None:
-        self._config = load_telegram_config()
         self._loop = asyncio.get_running_loop()
-        if not self._config or not self._config.enabled:
-            logger.info("Telegram оповещения отключены")
-            return
-        if not self._config.bot_token or not self._config.chat_id:
-            logger.warning("Telegram: не задан bot_token или chat_id")
-            return
-        self._http = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=30))
-        self._bus.subscribe(_SUB_ID, self._on_message)
-        logger.info("Telegram оповещения включены (chat_id=%s)",
-                     self._config.chat_id)
+        snapshot = load_telegram_config_snapshot(self._config_path)
+        await self.reload(snapshot, initial=True)
 
     async def stop(self) -> None:
+        async with self._reload_lock:
+            await self._deactivate()
+            self._loop = None
+
+    async def _deactivate(self, *, close_http: bool = True) -> None:
         if self._bus.has_subscriber(_SUB_ID):
             self._bus.unsubscribe(_SUB_ID)
-        if self._http and not self._http.closed:
+        if close_http and self._http and not self._http.closed:
             await self._http.close()
+        if close_http:
             self._http = None
-        self._loop = None
 
-    async def reload(self) -> None:
-        await self.stop()
-        await self.start()
+    async def reload(
+        self,
+        snapshot: TelegramConfigSnapshot | None = None,
+        *,
+        initial: bool = False,
+    ) -> bool:
+        """Apply one valid semantic config change, preserving last-known-good state."""
+        snapshot = snapshot or load_telegram_config_snapshot(self._config_path)
+        async with self._reload_lock:
+            if not initial and snapshot.fingerprint == self._observed_fingerprint:
+                return False
+            if snapshot.config is None:
+                self._observed_fingerprint = snapshot.fingerprint
+                if initial and self._config is None:
+                    self._config = TelegramConfig()
+                if not initial:
+                    logger.warning(
+                        "Telegram config reload skipped; keeping last-known-good state: %s",
+                        snapshot.error,
+                    )
+                return False
+
+            config = snapshot.config
+            should_be_ready = bool(config.enabled and config.bot_token and config.chat_id)
+            is_inactive = self._http is None and not self._bus.has_subscriber(_SUB_ID)
+            if self._config == config and (
+                (should_be_ready and self.is_ready) or (not should_be_ready and is_inactive)
+            ):
+                self._observed_fingerprint = snapshot.fingerprint
+                return False
+
+            reuse_http = bool(should_be_ready and self._http and not self._http.closed)
+            new_http = self._http if reuse_http else None
+            if should_be_ready and new_http is None:
+                new_http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
+
+            try:
+                await self._deactivate(close_http=not reuse_http)
+            except BaseException:
+                if not reuse_http and new_http and not new_http.closed:
+                    await new_http.close()
+                raise
+            self._config = config
+            self._http = new_http
+            if not config.enabled:
+                logger.info("Telegram оповещения отключены")
+            elif not config.bot_token or not config.chat_id:
+                logger.warning("Telegram: не задан bot_token или chat_id")
+            else:
+                self._bus.subscribe(_SUB_ID, self._on_message)
+                logger.info("Telegram оповещения включены (chat_id=%s)", config.chat_id)
+            self._observed_fingerprint = snapshot.fingerprint
+            return True
+
+    @property
+    def observed_fingerprint(self) -> str | None:
+        return self._observed_fingerprint
 
     @property
     def is_ready(self) -> bool:
-        return bool(self._config and self._http and self._loop)
+        return bool(
+            self._config
+            and self._config.enabled
+            and self._http
+            and not self._http.closed
+            and self._loop
+            and self._bus.has_subscriber(_SUB_ID)
+        )
 
     def make_log_handler(self, fmt: str) -> logging.Handler:
         handler = TelegramLogHandler(self)
