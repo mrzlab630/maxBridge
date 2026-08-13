@@ -61,18 +61,18 @@ def load_config(config_path: str | None = None) -> dict[str, Any]:
 
 
 _ALLOWED_ENV_OVERRIDES = {
-    "MAXBRIDGE_MAX_PHONE",
-    "MAXBRIDGE_LOGGING_LEVEL",
+    "MAXBRIDGE_MAX_PHONE": ("max", "phone"),
+    "MAXBRIDGE_LOGGING_LEVEL": ("logging", "level"),
+    "MAXBRIDGE_DAEMON_PID_FILE": ("daemon", "pid_file"),
 }
 
 
 def _apply_env_overrides(config: dict) -> None:
     """Apply whitelisted MAXBRIDGE_* env vars as overrides."""
     for key, value in os.environ.items():
-        if key not in _ALLOWED_ENV_OVERRIDES:
+        parts = _ALLOWED_ENV_OVERRIDES.get(key)
+        if parts is None:
             continue
-        prefix = "MAXBRIDGE_"
-        parts = key[len(prefix):].lower().split("_")
         target = config
         for part in parts[:-1]:
             target = target.setdefault(part, {})

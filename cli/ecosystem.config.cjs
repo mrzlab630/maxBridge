@@ -12,6 +12,7 @@ module.exports = {
       args: "",
       env: {
         PYTHONUNBUFFERED: "1",
+        MAXBRIDGE_DAEMON_PID_FILE: path.resolve(__dirname, "data", "maxbridge.pid"),
       },
       autorestart: true,
       watch: false,

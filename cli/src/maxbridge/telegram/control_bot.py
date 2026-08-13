@@ -21,6 +21,7 @@ from maxbridge.auth.qr_auth import (
 from maxbridge.client.account_manager import AccountManager
 from maxbridge.ipc.stats import StatsCollector
 from maxbridge.telegram.config import TelegramConfig, load_telegram_config
+from maxbridge.telegram.polling_lease import TelegramPollingLease
 
 logger = logging.getLogger("maxbridge.telegram.control_bot")
 
@@ -65,6 +66,10 @@ class _NormalizedSecret:
     zero_width_removed: int
 
 
+class TelegramPollingExternalConflict(RuntimeError):
+    """Telegram reports another active getUpdates consumer."""
+
+
 class TelegramControlBot:
     """Receives Telegram commands and can trigger QR re-auth."""
 
@@ -80,12 +85,32 @@ class TelegramControlBot:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._offset = 0
         self._poll_task: asyncio.Task | None = None
+        self._polling_lease: TelegramPollingLease | None = None
+        self._polling_enabled = False
+        self._conflict_state = "disabled"
+        self._consecutive_conflicts = 0
         self._auth_tasks: dict[str, asyncio.Task] = {}
         self._pending_secret_prompts: dict[str, _PendingSecretPrompt] = {}
 
     @property
     def is_ready(self) -> bool:
-        return bool(self._config and self._http and self._loop and self._poll_task)
+        return bool(
+            self._polling_enabled
+            and self._config
+            and self._http
+            and self._loop
+            and self._poll_task
+            and not self._poll_task.done()
+        )
+
+    @property
+    def polling_health(self) -> dict[str, bool | int | str]:
+        return {
+            "polling_enabled": self._polling_enabled,
+            "lease_held": bool(self._polling_lease and self._polling_lease.held),
+            "conflict_state": self._conflict_state,
+            "consecutive_conflicts": self._consecutive_conflicts,
+        }
 
     def set_status_provider(self,
                             provider: Callable[[], dict[str, Any]] | None) -> None:
@@ -94,22 +119,45 @@ class TelegramControlBot:
     async def start(self) -> None:
         if self._poll_task and not self._poll_task.done():
             return
+        if self._conflict_state == "external_conflict":
+            return
 
         self._config = load_telegram_config()
         self._loop = asyncio.get_running_loop()
         if not self._config.enabled:
+            self._conflict_state = "disabled"
             logger.info("Telegram control bot disabled")
             return
         if not self._config.bot_token or not self._config.chat_id:
+            self._conflict_state = "disabled"
             logger.warning("Telegram control bot: missing bot_token or chat_id")
             return
 
-        self._http = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=_POLL_TIMEOUT + 10),
-        )
-        self._offset = await self._bootstrap_offset()
+        self._conflict_state = "starting"
+        lease = TelegramPollingLease(self._config.bot_token)
+        try:
+            lease.acquire()
+        except Exception:
+            self._conflict_state = "stopped"
+            raise
+        self._polling_lease = lease
+        try:
+            self._http = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=_POLL_TIMEOUT + 10),
+            )
+            self._offset = await self._bootstrap_offset()
+        except TelegramPollingExternalConflict:
+            self._record_external_conflict()
+            await self._release_polling_resources()
+            return
+        except Exception:
+            await self._release_polling_resources()
+            self._conflict_state = "stopped"
+            raise
+        self._polling_enabled = True
+        self._conflict_state = "healthy"
         self._poll_task = asyncio.create_task(self._poll_loop())
-        logger.info("Telegram control bot enabled (chat_id=%s)", self._config.chat_id)
+        logger.info("Telegram control bot polling enabled")
 
     async def stop(self) -> None:
         if self._poll_task and not self._poll_task.done():
@@ -129,9 +177,10 @@ class TelegramControlBot:
                 pending.future.cancel()
         self._pending_secret_prompts.clear()
 
-        if self._http and not self._http.closed:
-            await self._http.close()
-        self._http = None
+        await self._release_polling_resources()
+        self._polling_enabled = False
+        if self._conflict_state != "external_conflict":
+            self._conflict_state = "stopped"
         self._loop = None
 
     def request_auth_nowait(self, account_id: str, exc: Exception) -> None:
@@ -154,22 +203,56 @@ class TelegramControlBot:
         return int(updates[-1].get("update_id", 0)) + 1
 
     async def _poll_loop(self) -> None:
-        while True:
-            try:
-                updates = await self._get_updates(timeout=_POLL_TIMEOUT)
-                if updates is None:
+        try:
+            while True:
+                try:
+                    updates = await self._get_updates(timeout=_POLL_TIMEOUT)
+                    if updates is None:
+                        await asyncio.sleep(_RETRY_DELAY)
+                        continue
+                    for update in updates:
+                        update_id = int(update.get("update_id", 0))
+                        if update_id:
+                            self._offset = max(self._offset, update_id + 1)
+                        await self._handle_update(update)
+                except asyncio.CancelledError:
+                    raise
+                except TelegramPollingExternalConflict:
+                    self._record_external_conflict()
+                    return
+                except Exception:
+                    logger.exception("Telegram control polling failed")
                     await asyncio.sleep(_RETRY_DELAY)
-                    continue
-                for update in updates:
-                    update_id = int(update.get("update_id", 0))
-                    if update_id:
-                        self._offset = max(self._offset, update_id + 1)
-                    await self._handle_update(update)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception("Telegram control polling failed")
-                await asyncio.sleep(_RETRY_DELAY)
+        finally:
+            if self._conflict_state == "external_conflict":
+                await self._release_polling_resources()
+
+    def _record_external_conflict(self) -> None:
+        if self._conflict_state == "external_conflict":
+            return
+        self._polling_enabled = False
+        self._conflict_state = "external_conflict"
+        self._consecutive_conflicts += 1
+        logger.warning(
+            "Telegram control bot external polling conflict; operator-triggered restart required",
+        )
+
+    async def _release_polling_resources(self) -> None:
+        http = self._http
+        self._http = None
+        lease = self._polling_lease
+        self._polling_lease = None
+        try:
+            if http and not http.closed:
+                await http.close()
+        except Exception as exc:
+            logger.warning(
+                "Telegram control bot HTTP cleanup failed: %s",
+                exc.__class__.__name__,
+            )
+        finally:
+            if lease is not None:
+                lease.release()
 
     async def _handle_update(self, update: dict[str, Any]) -> None:
         message = update.get("message") or update.get("channel_post")
@@ -181,10 +264,7 @@ class TelegramControlBot:
         raw_text = str(message.get("text") or "")
         text = raw_text.strip()
         if text.startswith("/") and not self._is_allowed_chat(message):
-            logger.warning(
-                "Telegram control command ignored from unexpected chat_id=%s",
-                source_chat_id,
-            )
+            logger.warning("Telegram control command ignored from an unexpected chat")
             return
         if not self._is_allowed_chat(message):
             return
@@ -194,9 +274,8 @@ class TelegramControlBot:
 
         command, arg = self._parse_command(text)
         logger.info(
-            "Telegram control command received: command=%s chat_id=%s",
+            "Telegram control command received: command=%s",
             command or "?",
-            source_chat_id,
         )
         if command == "auth":
             await self._handle_auth_command(arg, source_chat_id)
@@ -356,10 +435,9 @@ class TelegramControlBot:
         )
         pending.future.set_result(reply)
         logger.info(
-            "Telegram secret reply received: kind=%s account=%s chat_id=%s",
+            "Telegram secret reply received: kind=%s account=%s",
             pending.kind,
             pending.account_id,
-            chat_id,
         )
         return True
 
@@ -396,10 +474,9 @@ class TelegramControlBot:
                     await self._delete_message(reply.message_id, chat_id=chat_id)
             normalized = _normalize_secret_text(reply.text)
             logger.info(
-                "MAX password input normalized: account=%s chat_id=%s "
+                "MAX password input normalized: account=%s "
                 "raw_len=%d clean_len=%d trimmed=%s zero_width_removed=%d",
                 account_id,
-                chat_id,
                 normalized.raw_length,
                 normalized.clean_length,
                 normalized.trimmed,
@@ -410,9 +487,8 @@ class TelegramControlBot:
             return normalized.value
         except ValueError as exc:
             logger.warning(
-                "MAX password input rejected: account=%s chat_id=%s reason=%s",
+                "MAX password input rejected: account=%s reason=%s",
                 account_id,
-                chat_id,
                 str(exc),
             )
             raise RuntimeError(str(exc)) from exc
@@ -483,16 +559,21 @@ class TelegramControlBot:
                 return await self._parse_tg_response(method, resp)
         except asyncio.CancelledError:
             raise
+        except TelegramPollingExternalConflict:
+            raise
         except _TRANSIENT_REQUEST_ERRORS as exc:
             logger.warning(
-                "Telegram control bot %s transient request error: %s: %s",
+                "Telegram control bot %s transient request error: %s",
                 method,
                 exc.__class__.__name__,
-                exc,
             )
             return None
-        except Exception:
-            logger.exception("Telegram control bot %s request failed", method)
+        except Exception as exc:
+            logger.warning(
+                "Telegram control bot %s request failed: %s",
+                method,
+                exc.__class__.__name__,
+            )
             return None
 
     async def _call_form(self, method: str,
@@ -506,17 +587,23 @@ class TelegramControlBot:
                 return await self._parse_tg_response(method, resp)
         except asyncio.CancelledError:
             raise
-        except Exception:
-            logger.exception("Telegram control bot %s request failed", method)
+        except Exception as exc:
+            logger.warning(
+                "Telegram control bot %s request failed: %s",
+                method,
+                exc.__class__.__name__,
+            )
             return None
 
     async def _parse_tg_response(self, method: str,
                                  resp: aiohttp.ClientResponse) -> dict[str, Any] | None:
+        if method == "getUpdates" and resp.status == 409:
+            raise TelegramPollingExternalConflict()
         data = await resp.json(content_type=None)
         if resp.status != 200 or not data.get("ok", False):
             logger.warning(
-                "Telegram control bot %s failed: status=%s body=%s",
-                method, resp.status, str(data)[:300],
+                "Telegram control bot %s failed: status=%s",
+                method, resp.status,
             )
             return None
         return data
@@ -638,6 +725,7 @@ class TelegramControlBot:
         runtime = self._status_provider() if self._status_provider else {}
 
         telegram = runtime.get("telegram", {})
+        control_health = telegram.get("control_bot", self.polling_health)
         bridge = runtime.get("bridge", {})
         daemon = runtime.get("daemon", {})
         error_stats = stats.get("errors", {})
@@ -675,7 +763,22 @@ class TelegramControlBot:
                 "• Бот управления: "
                 f"{_esc(_service_state(telegram.get('control_bot_ready', self.is_ready)))}"
             ),
-            f"• Long polling: {_esc(_polling_state(self._poll_task))}",
+            (
+                "• Long polling: "
+                f"{_esc(_feature_state(control_health.get('polling_enabled', False)))}"
+            ),
+            (
+                "• Polling lease: "
+                f"{_esc(_feature_state(control_health.get('lease_held', False)))}"
+            ),
+            (
+                "• Polling state: "
+                f"<code>{_esc(control_health.get('conflict_state', 'stopped'))}</code>"
+            ),
+            (
+                "• Последовательных конфликтов: "
+                f"{int(control_health.get('consecutive_conflicts', 0))}"
+            ),
             f"• Активных QR: {len(self._auth_tasks)}",
             (
                 "• Форвардер: "

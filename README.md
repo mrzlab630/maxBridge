@@ -116,6 +116,7 @@ python -m maxbridge.main --auth-only
 python -m maxbridge.main
 
 # Фоновый запуск
+# Допустим только когда systemd и PM2 остановлены.
 nohup python -m maxbridge.main > /dev/null 2>&1 &
 
 # С отладкой
@@ -282,6 +283,15 @@ socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/maxbridge.sock
 
 ## Деплой
 
+systemd и PM2 являются mutually exclusive владельцами демона: одновременно должен быть
+запущен только один supervisor. TUI и Commander остаются клиентскими/operator surfaces и
+не запускают отдельный Telegram poller. Ручной `nohup` разрешён только после остановки
+обоих supervisor-ов.
+
+`daemon.pid_file` и `MAXBRIDGE_DAEMON_PID_FILE` задают application PID lock. Это не
+внутренние PID-файлы PM2 в `PM2_HOME`: для приложения не используется настройка PM2
+`pid_file`.
+
 ### PM2
 
 PM2 запускает демон `maxbridge` из локального virtualenv и автоматически перезапускает его после сбоя. TUI через PM2 не запускается.
@@ -335,6 +345,7 @@ npm run pm2:save
 ```
 
 PM2 пишет логи в `logs/maxbridge-out.log` и `logs/maxbridge-error.log`.
+Application PID lock при этом находится в `cli/data/maxbridge.pid`.
 
 ### systemd
 
@@ -343,11 +354,22 @@ sudo bash deploy/install.sh
 sudo systemctl start maxbridge
 ```
 
+systemd передаёт application PID path `/run/maxbridge/maxbridge.pid` через
+`MAXBRIDGE_DAEMON_PID_FILE` и владеет соответствующим runtime-каталогом.
+
 ### Ручной запуск
 
 ```bash
 nohup python -m maxbridge.main > /dev/null 2>&1 &
 ```
+
+### Восстановление Telegram polling после 409
+
+Состояние `external_conflict` отключает только Telegram control-plane polling; MAX и
+форвардинг продолжают работу. Аренда защищает один host и один Linux network namespace,
+поэтому сначала найдите и остановите внешний consumer. Затем выполните явный
+operator-triggered restart выбранного единственного supervisor-а. Автоматического retry
+или повторного захвата аренды у конфликтовавшего объекта нет.
 
 ## Безопасность
 

@@ -273,6 +273,19 @@ Update rule:
     - bot token / chat IDs remain in `data/telegram.json`, which stays ignored by Git
     - local artifacts `.codex` and `.playwright-mcp/` should remain ignored
 
+## [2026-08-13] Single Telegram Poller And Supervisor Ownership
+- **Decision:** systemd and PM2 are mutually exclusive daemon owners. Manual `nohup` is
+  permitted only when both are stopped; TUI and Commander do not own a poller.
+- **PID invariant:** `daemon.pid_file` / `MAXBRIDGE_DAEMON_PID_FILE` is the application
+  lock and is separate from supervisor-internal `PM2_HOME` state. systemd uses
+  `/run/maxbridge/maxbridge.pid`; PM2 uses the repo-local data directory.
+- **Polling invariant:** Telegram ownership is keyed only by bot identity and is local to
+  one host and Linux network namespace. The lease carries no filesystem state or public
+  identity material.
+- **Conflict invariant:** Telegram HTTP 409 latches `external_conflict`, degrades only the
+  control plane, and requires an operator-triggered restart after the external consumer is
+  stopped. MAX runtime and forwarding stay available; no automatic reacquisition occurs.
+
 ## [2026-04-21] Delayed Attachment Recovery Strategy
 - **Decision:** Treat delayed attachment readiness as a first-class bridge concern and process MAX `opcode 136` separately from normal `opcode 128` messages.
 - **Reason:** Some MAX messages arrive before media becomes usable; without a second recovery path the bridge can forward text while silently losing the attachment.

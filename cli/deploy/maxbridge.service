@@ -11,8 +11,11 @@ RestartSec=5
 User=maxbridge
 Group=maxbridge
 RuntimeDirectory=maxbridge
+RuntimeDirectoryMode=0750
 StateDirectory=maxbridge
 LogsDirectory=maxbridge
+Environment=MAXBRIDGE_DAEMON_PID_FILE=/run/maxbridge/maxbridge.pid
+PIDFile=/run/maxbridge/maxbridge.pid
 
 # Security hardening
 ProtectSystem=strict

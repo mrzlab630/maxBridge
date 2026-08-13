@@ -49,6 +49,51 @@ async def _drain_background_tasks(
         await loop.shutdown_default_executor()
 
 
+def _register_configured_accounts(manager: AccountManager, config: dict) -> None:
+    accounts_cfg = config.get("accounts", {})
+    if not accounts_cfg:
+        max_cfg = config.get("max", {})
+        if max_cfg:
+            accounts_cfg = {"default": max_cfg}
+    for account_id, acc_config in accounts_cfg.items():
+        manager.add_account(account_id, acc_config)
+
+
+class TerminalAuthenticator:
+    """Terminal-only MAX authentication without daemon or Telegram resources."""
+
+    def __init__(self, config: dict) -> None:
+        key_path = get_nested(config, "security.key_file", "data/master.key")
+        encryptor = TokenEncryptor(key_path)
+        encryptor.ensure_key()
+        self._manager = AccountManager(encryptor)
+        _register_configured_accounts(self._manager, config)
+
+    async def authenticate(self, account_id: str | None = None) -> None:
+        targets = self._get_auth_targets(account_id)
+        for aid in targets:
+            account = self._manager.require(aid)
+            if account.has_session():
+                logger.info("Account '%s' already has a session — skipping", aid)
+                continue
+
+            print(f"\n[{aid}] Authenticating via QR code...")
+            print(f"[{aid}] Open MAX on your phone and scan the QR code.\n")
+            try:
+                await account.authenticate_qr()
+            except (MaxApiError, MaxConnectionError):
+                raise
+            except Exception as exc:
+                raise RuntimeError(f"[{aid}] QR auth failed: {exc}") from exc
+            logger.info("Account '%s' authenticated successfully", aid)
+
+    def _get_auth_targets(self, account_id: str | None) -> list[str]:
+        if account_id:
+            self._manager.require(account_id)
+            return [account_id]
+        return self._manager.account_ids
+
+
 class MaxBridgeDaemon:
     """Main daemon: multi-account, entity cache, stats, IPC server."""
 
@@ -56,6 +101,8 @@ class MaxBridgeDaemon:
         self._config = config
         self._shutdown_event = asyncio.Event()
         self._pid_fd: int | None = None
+        self._pid_identity: tuple[int, int, int] | None = None
+        self._pid_path: Path | None = None
         self._telegram_error_handler: logging.Handler | None = None
         self._stats_error_handler: logging.Handler | None = None
 
@@ -86,13 +133,7 @@ class MaxBridgeDaemon:
         self._register_accounts(config)
 
     def _register_accounts(self, config: dict) -> None:
-        accounts_cfg = config.get("accounts", {})
-        if not accounts_cfg:
-            max_cfg = config.get("max", {})
-            if max_cfg:
-                accounts_cfg = {"default": max_cfg}
-        for account_id, acc_config in accounts_cfg.items():
-            self._manager.add_account(account_id, acc_config)
+        _register_configured_accounts(self._manager, config)
 
     async def start(self) -> None:
         logger.info("maxBridge v%s starting (%d accounts)...",
@@ -141,63 +182,67 @@ class MaxBridgeDaemon:
         self._detach_error_notifications()
         logger.info("maxBridge stopped.")
 
-    async def authenticate(self, account_id: str | None = None) -> None:
-        """Authenticate accounts. Uses QR code (primary) or SMS (fallback)."""
-        await self._telegram.start()
-        await self._control_bot.start()
-        self._attach_error_notifications()
-        targets = self._get_auth_targets(account_id)
-        for aid in targets:
-            account = self._manager.require(aid)
-            if account.has_session():
-                logger.info("Account '%s' already has a session — skipping", aid)
-                continue
-
-            print(f"\n[{aid}] Authenticating via QR code...")
-            print(f"[{aid}] Open MAX on your phone and scan the QR code.\n")
-            try:
-                await account.authenticate_qr()
-            except (MaxApiError, MaxConnectionError):
-                raise
-            except Exception as e:
-                raise RuntimeError(f"[{aid}] QR auth failed: {e}") from e
-            logger.info("Account '%s' authenticated successfully", aid)
-
-    def _get_auth_targets(self, account_id: str | None) -> list[str]:
-        if account_id:
-            self._manager.require(account_id)
-            return [account_id]
-        return self._manager.account_ids
-
     def _write_pid(self) -> None:
-        pid_path = Path(get_nested(self._config, "daemon.pid_file", "/tmp/maxbridge.pid"))
+        pid_path = self._validated_pid_path()
         pid_path.parent.mkdir(parents=True, exist_ok=True)
         if pid_path.is_symlink():
             raise OSError(f"PID path {pid_path} is a symlink — refusing")
-        self._pid_fd = os.open(
-            str(pid_path), os.O_CREAT | os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        fd = os.open(
+            str(pid_path), os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600,
+        )
         try:
-            fcntl.flock(self._pid_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            os.close(self._pid_fd)
-            self._pid_fd = None
+            os.close(fd)
             raise RuntimeError(f"Another instance is running (PID locked: {pid_path})")
-        os.write(self._pid_fd, str(os.getpid()).encode())
-        os.fsync(self._pid_fd)
+        except Exception:
+            os.close(fd)
+            raise
+        try:
+            pid = os.getpid()
+            stat_result = os.fstat(fd)
+            os.ftruncate(fd, 0)
+            os.lseek(fd, 0, os.SEEK_SET)
+            os.write(fd, str(pid).encode())
+            os.fsync(fd)
+        except Exception:
+            os.close(fd)
+            raise
+        self._pid_fd = fd
+        self._pid_identity = (stat_result.st_dev, stat_result.st_ino, pid)
+        self._pid_path = pid_path
 
     def _remove_pid(self) -> None:
-        pid_path = get_nested(self._config, "daemon.pid_file", "/tmp/maxbridge.pid")
-        if self._pid_fd is not None:
-            try:
-                fcntl.flock(self._pid_fd, fcntl.LOCK_UN)
-                os.close(self._pid_fd)
-            except Exception:
-                pass
-            self._pid_fd = None
+        fd = self._pid_fd
+        identity = self._pid_identity
+        pid_path = self._pid_path
+        if fd is None or identity is None or pid_path is None:
+            return
+        self._pid_fd = None
+        self._pid_identity = None
+        self._pid_path = None
         try:
-            Path(pid_path).unlink()
-        except FileNotFoundError:
-            pass
+            try:
+                descriptor_stat = os.fstat(fd)
+                path_stat = os.stat(pid_path, follow_symlinks=False)
+            except OSError:
+                return
+            descriptor_identity = (descriptor_stat.st_dev, descriptor_stat.st_ino)
+            if descriptor_identity != identity[:2]:
+                return
+            if (path_stat.st_dev, path_stat.st_ino) == identity[:2]:
+                pid_path.unlink()
+        finally:
+            os.close(fd)
+
+    def _validated_pid_path(self) -> Path:
+        value = get_nested(self._config, "daemon.pid_file", "/tmp/maxbridge.pid")
+        if not isinstance(value, str) or not value.strip():
+            raise RuntimeError("daemon.pid_file must be a non-empty absolute path")
+        path = Path(value)
+        if not path.is_absolute():
+            raise RuntimeError("daemon.pid_file must be a non-empty absolute path")
+        return path
 
     def request_shutdown(self) -> None:
         self._shutdown_event.set()
@@ -237,6 +282,7 @@ class MaxBridgeDaemon:
             },
             "telegram": {
                 "control_bot_ready": self._control_bot.is_ready,
+                "control_bot": self._control_bot.polling_health,
                 "forwarder_ready": self._telegram.is_ready,
                 "alerts_enabled": self._telegram_error_handler is not None,
             },
@@ -276,9 +322,11 @@ def cli_entry() -> None:
         fmt=get_nested(config, "logging.format",
                        "%(asctime)s [%(levelname)s] %(name)s: %(message)s"),
     )
-    daemon = MaxBridgeDaemon(config)
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
+    daemon: MaxBridgeDaemon | None = None
+    normal_daemon_entered = False
+    daemon_lifecycle_started = False
 
     def _handle_loop_exception(_loop: asyncio.AbstractEventLoop,
                                context: dict) -> None:
@@ -290,13 +338,17 @@ def cli_entry() -> None:
             logger.error(msg)
 
     loop.set_exception_handler(_handle_loop_exception)
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        loop.add_signal_handler(sig, daemon.request_shutdown)
     try:
         if args.auth_only:
-            loop.run_until_complete(daemon.authenticate(args.account))
+            authenticator = TerminalAuthenticator(config)
+            loop.run_until_complete(authenticator.authenticate(args.account))
             print("Authentication complete. Session(s) saved.")
         else:
+            normal_daemon_entered = True
+            daemon = MaxBridgeDaemon(config)
+            for sig in (signal.SIGTERM, signal.SIGINT):
+                loop.add_signal_handler(sig, daemon.request_shutdown)
+            daemon_lifecycle_started = True
             loop.run_until_complete(daemon.start())
     except KeyboardInterrupt:
         pass
@@ -311,8 +363,17 @@ def cli_entry() -> None:
         print(f"\n[ERROR] {e}")
     finally:
         try:
-            loop.run_until_complete(daemon.stop())
-            loop.run_until_complete(_drain_background_tasks(loop))
+            if normal_daemon_entered:
+                try:
+                    if daemon_lifecycle_started and daemon is not None:
+                        loop.run_until_complete(daemon.stop())
+                finally:
+                    loop.run_until_complete(_drain_background_tasks(loop))
+            else:
+                try:
+                    loop.run_until_complete(loop.shutdown_asyncgens())
+                finally:
+                    loop.run_until_complete(loop.shutdown_default_executor())
         finally:
             loop.close()
 
