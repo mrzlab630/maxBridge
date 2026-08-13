@@ -22,7 +22,7 @@ chmod 700 "$STATE_DIR/data"
 
 # Copy config if not exists
 if [ ! -f "$CONFIG_DIR/config.yaml" ]; then
-    cp config/default.yaml "$CONFIG_DIR/config.yaml"
+    cp src/maxbridge/data/default.yaml "$CONFIG_DIR/config.yaml"
     chown "$SERVICE_USER:$SERVICE_USER" "$CONFIG_DIR/config.yaml"
     chmod 600 "$CONFIG_DIR/config.yaml"
     echo "Config created: $CONFIG_DIR/config.yaml"

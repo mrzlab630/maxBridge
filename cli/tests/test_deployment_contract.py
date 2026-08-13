@@ -6,6 +6,15 @@ CLI_ROOT = pathlib.Path(__file__).resolve().parents[1]
 REPO_ROOT = CLI_ROOT.parent
 
 
+def test_installer_uses_packaged_default_config():
+    installer = (CLI_ROOT / "deploy/install.sh").read_text(encoding="utf-8")
+    default_config = CLI_ROOT / "src/maxbridge/data/default.yaml"
+
+    assert default_config.is_file()
+    assert "src/maxbridge/data/default.yaml" in installer
+    assert "config/default.yaml" not in installer
+
+
 def test_systemd_application_pid_contract_is_consistent():
     unit = (CLI_ROOT / "deploy/maxbridge.service").read_text(encoding="utf-8")
     required = [
