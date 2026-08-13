@@ -29,7 +29,7 @@ if [ ! -f "$CONFIG_DIR/config.yaml" ]; then
 fi
 
 # Install package
-pip install -e .
+python3 -m pip install .
 
 # Install systemd unit
 cp deploy/maxbridge.service /etc/systemd/system/

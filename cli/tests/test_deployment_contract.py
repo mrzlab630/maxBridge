@@ -15,6 +15,15 @@ def test_installer_uses_packaged_default_config():
     assert "config/default.yaml" not in installer
 
 
+def test_installer_uses_python3_bound_non_editable_install():
+    installer = (CLI_ROOT / "deploy/install.sh").read_text(encoding="utf-8")
+
+    assert installer.count("python3 -m pip install .") == 1
+    assert "pip install -e" not in installer
+    assert "pip install --editable" not in installer
+    assert "-e ." not in installer
+
+
 def test_systemd_application_pid_contract_is_consistent():
     unit = (CLI_ROOT / "deploy/maxbridge.service").read_text(encoding="utf-8")
     required = [
