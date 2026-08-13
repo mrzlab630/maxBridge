@@ -1,27 +1,94 @@
-"""Static deployment ownership contracts."""
+"""Static and executable deployment contracts."""
 
+import os
 import pathlib
+import shutil
+import stat
+import subprocess
 
 CLI_ROOT = pathlib.Path(__file__).resolve().parents[1]
 REPO_ROOT = CLI_ROOT.parent
+INSTALLER = CLI_ROOT / "deploy/install.sh"
 
 
-def test_installer_uses_packaged_default_config():
-    installer = (CLI_ROOT / "deploy/install.sh").read_text(encoding="utf-8")
-    default_config = CLI_ROOT / "src/maxbridge/data/default.yaml"
-
-    assert default_config.is_file()
-    assert "src/maxbridge/data/default.yaml" in installer
-    assert "config/default.yaml" not in installer
+def _installer_text() -> str:
+    return INSTALLER.read_text(encoding="utf-8")
 
 
-def test_installer_uses_python3_bound_non_editable_install():
-    installer = (CLI_ROOT / "deploy/install.sh").read_text(encoding="utf-8")
+def test_installer_is_local_first_and_avoids_privileged_paths():
+    installer = _installer_text()
 
-    assert installer.count("python3 -m pip install .") == 1
+    assert 'CLI_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"' in installer
+    assert 'cd "$CLI_ROOT"' in installer
+    for forbidden in ("useradd", "/etc/maxbridge", "/usr/local", "/var/lib", "systemctl", "sudo"):
+        assert forbidden not in installer
+
+
+def test_installer_uses_checkout_venv_for_regular_and_optional_dev_install():
+    installer = _installer_text()
+
+    assert "python3 -m venv .venv" in installer
+    assert installer.count(".venv/bin/python -m pip install .") == 1
+    assert 'if [ "${INSTALL_DEV:-0}" = "1" ]; then' in installer
+    assert installer.count(".venv/bin/python -m pip install '.[dev]'") == 1
     assert "pip install -e" not in installer
     assert "pip install --editable" not in installer
-    assert "-e ." not in installer
+
+
+def test_installer_creates_and_preserves_local_state_from_arbitrary_cwd(tmp_path):
+    checkout = tmp_path / "checkout" / "cli"
+    (checkout / "deploy").mkdir(parents=True)
+    (checkout / "src/maxbridge/data").mkdir(parents=True)
+    shutil.copy2(INSTALLER, checkout / "deploy/install.sh")
+    (checkout / "src/maxbridge/data/default.yaml").write_text("marker: default\n", encoding="utf-8")
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_python = fake_bin / "python3"
+    fake_python.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = \"-m\" ] && [ \"$2\" = \"venv\" ]; then\n"
+        "    mkdir -p .venv/bin\n"
+        "    cp \"$0\" .venv/bin/python\n"
+        "else\n"
+        "    printf '%s\\n' \"$*\" >> pip-calls\n"
+        "fi\n",
+        encoding="utf-8",
+    )
+    fake_python.chmod(fake_python.stat().st_mode | stat.S_IXUSR)
+    env = {**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}", "INSTALL_DEV": "1"}
+
+    first = subprocess.run(
+        ["bash", str(checkout / "deploy/install.sh")],
+        cwd=tmp_path,
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    config = checkout / "config/local.yaml"
+    assert config.read_text(encoding="utf-8") == "marker: default\n"
+    assert stat.S_IMODE(config.stat().st_mode) == 0o600
+    assert (checkout / "data").is_dir()
+    assert (checkout / "logs").is_dir()
+    assert (checkout / "pip-calls").read_text(encoding="utf-8").splitlines() == [
+        "-m pip install .",
+        "-m pip install .[dev]",
+    ]
+    assert f"cd {checkout}" in first.stdout
+    assert "Authenticate: .venv/bin/maxbridge --auth-only -c config/local.yaml" in first.stdout
+    assert "Start:        .venv/bin/maxbridge -c config/local.yaml" in first.stdout
+
+    config.write_text("marker: operator\n", encoding="utf-8")
+    subprocess.run(
+        ["bash", str(checkout / "deploy/install.sh")],
+        cwd=tmp_path,
+        env={**env, "INSTALL_DEV": "0"},
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert config.read_text(encoding="utf-8") == "marker: operator\n"
 
 
 def test_systemd_application_pid_contract_is_consistent():

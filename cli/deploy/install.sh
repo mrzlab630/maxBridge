@@ -1,45 +1,34 @@
 #!/bin/bash
-# maxBridge systemd installation script
+# Build and install maxBridge into this checkout.
 
 set -euo pipefail
 
-SERVICE_USER="maxbridge"
-CONFIG_DIR="/etc/maxbridge"
-STATE_DIR="/var/lib/maxbridge"
+CLI_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$CLI_ROOT"
 
-echo "=== maxBridge Installation ==="
+echo "=== maxBridge local installation ==="
 
-# Create service user
-if ! id "$SERVICE_USER" &>/dev/null; then
-    useradd --system --shell /usr/sbin/nologin --home-dir "$STATE_DIR" "$SERVICE_USER"
-    echo "Created user: $SERVICE_USER"
+if [ ! -x .venv/bin/python ]; then
+    python3 -m venv .venv
 fi
 
-# Create directories
-mkdir -p "$CONFIG_DIR" "$STATE_DIR/data"
-chown "$SERVICE_USER:$SERVICE_USER" "$STATE_DIR" "$STATE_DIR/data"
-chmod 700 "$STATE_DIR/data"
-
-# Copy config if not exists
-if [ ! -f "$CONFIG_DIR/config.yaml" ]; then
-    cp src/maxbridge/data/default.yaml "$CONFIG_DIR/config.yaml"
-    chown "$SERVICE_USER:$SERVICE_USER" "$CONFIG_DIR/config.yaml"
-    chmod 600 "$CONFIG_DIR/config.yaml"
-    echo "Config created: $CONFIG_DIR/config.yaml"
+.venv/bin/python -m pip install .
+if [ "${INSTALL_DEV:-0}" = "1" ]; then
+    .venv/bin/python -m pip install '.[dev]'
 fi
 
-# Install package
-python3 -m pip install .
-
-# Install systemd unit
-cp deploy/maxbridge.service /etc/systemd/system/
-systemctl daemon-reload
-systemctl enable maxbridge
+mkdir -p config data logs
+if [ ! -f config/local.yaml ]; then
+    cp src/maxbridge/data/default.yaml config/local.yaml
+    chmod 600 config/local.yaml 2>/dev/null || true
+    echo "Config created: $CLI_ROOT/config/local.yaml"
+else
+    echo "Config preserved: $CLI_ROOT/config/local.yaml"
+fi
 
 echo ""
 echo "=== Installation complete ==="
-echo "1. Edit config:    sudo nano $CONFIG_DIR/config.yaml"
-echo "2. Authenticate:   sudo -u $SERVICE_USER maxbridge --auth-only -c $CONFIG_DIR/config.yaml"
-echo "3. Start:          sudo systemctl start maxbridge"
-echo "4. Status:         sudo systemctl status maxbridge"
-echo "5. Logs:           sudo journalctl -u maxbridge -f"
+echo "cd $CLI_ROOT"
+echo "Edit config:  \$EDITOR config/local.yaml"
+echo "Authenticate: .venv/bin/maxbridge --auth-only -c config/local.yaml"
+echo "Start:        .venv/bin/maxbridge -c config/local.yaml"

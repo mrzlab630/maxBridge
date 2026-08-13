@@ -281,9 +281,11 @@ socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/maxbridge.sock
 }
 ```
 
-## Production: сборка, установка и запуск
+## Production: локальная сборка, установка и запуск
 
-В production рекомендуется **systemd**. systemd, PM2 и ручной `nohup` — взаимоисключающие
+По умолчанию production-инсталляция остаётся в текущем checkout: установщик собирает пакет
+в `cli/.venv`, создаёт локальный конфиг и каталоги состояния и не меняет систему. systemd,
+PM2 и ручной запуск — mutually exclusive
 владельцы демона: в каждый момент должен работать ровно один supervisor. TUI и Commander
 остаются клиентскими/operator surfaces и не запускают отдельный Telegram poller.
 
@@ -292,13 +294,13 @@ socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/maxbridge.sock
 ```bash
 sudo systemctl status maxbridge --no-pager
 pm2 list
-pgrep -af '/usr/local/bin/maxbridge|maxbridge\.main'
+pgrep -af '/usr/local/bin/maxbridge|\.venv/bin/maxbridge|maxbridge\.main'
 ```
 
 `daemon.pid_file` и `MAXBRIDGE_DAEMON_PID_FILE` задают application PID lock. Это не
 внутренние PID-файлы PM2 в `PM2_HOME`; настройка PM2 `pid_file` для приложения не нужна.
 
-### Чистая установка через systemd
+### Локальная установка (по умолчанию)
 
 Получите **полный checkout** ветки `main`. Нельзя копировать на сервер только каталог
 `deploy/`: установщику одновременно нужны `deploy/`, `src/`, `pyproject.toml` и остальные
@@ -306,57 +308,43 @@ pgrep -af '/usr/local/bin/maxbridge|maxbridge\.main'
 
 ```bash
 git clone <URL-репозитория> maxBridge
-cd maxBridge
-git switch main
-git pull --ff-only
-
-# Обязательно запускать именно из корня Python-пакета cli:
-cd cli
-sudo bash deploy/install.sh
+./maxBridge/cli/deploy/install.sh
 ```
 
-Установщик создаёт системного пользователя `maxbridge` и каталоги состояния, затем
-выполняет `python3 -m pip install .` — это обычная **не editable**-установка в системный
-Python. После этого он копирует unit, выполняет `systemctl daemon-reload` и
-`systemctl enable maxbridge`, но **не запускает** сервис. Существующий
-`/etc/maxbridge/config.yaml` сохраняется; `src/maxbridge/data/default.yaml` копируется
-туда только при отсутствии конфига.
+Скрипт определяет каталог `cli` относительно собственного пути, поэтому его можно вызвать
+из любого cwd. Он создаёт `cli/.venv`, выполняет не editable-установку пакета и создаёт
+`cli/config/local.yaml` из packaged default только при отсутствии файла. Существующий
+локальный конфиг никогда не перезаписывается. Данные и логи остаются в `cli/data` и
+`cli/logs`; права нового конфига по возможности устанавливаются в `0600`.
 
-Если первый запуск установщика завершился после создания пользователя/каталогов или
-конфига, но до установки unit, устраните причину и безопасно повторите ту же команду из
-`maxBridge/cli`: эти подготовительные шаги идемпотентны, а существующий конфиг не будет
-перезаписан.
+Development extras необязательны: `INSTALL_DEV=1 ./maxBridge/cli/deploy/install.sh`.
 
-### Конфигурация, авторизация и первый старт
+Если первый запуск установщика прервался после создания `.venv`, каталогов или конфига,
+устраните причину и безопасно повторите ту же команду: локальные подготовительные шаги
+идемпотентны, а существующий конфиг не будет перезаписан.
+
+### Конфигурация, авторизация и первый локальный старт
 
 ```bash
-sudoedit /etc/maxbridge/config.yaml
-
-# Сервис должен быть остановлен: auth-only сам работает с сессией и не должен
-# конкурировать с production-демоном.
-sudo systemctl stop maxbridge
-sudo -u maxbridge /usr/local/bin/maxbridge --auth-only -c /etc/maxbridge/config.yaml
-
-sudo systemctl start maxbridge
-sudo systemctl status maxbridge --no-pager
-sudo journalctl -u maxbridge -n 100 --no-pager
-sudo journalctl -u maxbridge -f
+cd maxBridge/cli
+$EDITOR config/local.yaml
+.venv/bin/maxbridge --auth-only -c config/local.yaml
+.venv/bin/maxbridge -c config/local.yaml
+.venv/bin/maxbridge-tui
 ```
 
-Unit запускает `/usr/local/bin/maxbridge -c /etc/maxbridge/config.yaml`. Application PID
-находится в `/run/maxbridge/maxbridge.pid`; постоянные данные — в `/var/lib/maxbridge`,
-конфиг — в `/etc/maxbridge/config.yaml`. Проверить установленную версию можно без
-предположения о наличии флага `--version`:
+TUI подключается к уже выбранному демону. Переключатель демона в TUI не заменяет systemd
+или PM2: если процесс уже управляется supervisor-ом, не запускайте из TUI второй демон.
+
+При запуске из `cli` загрузчик конфигурации сначала найдёт `config/local.yaml`, раньше
+legacy-файла `/etc/maxbridge/config.yaml`. Проверить локально установленную версию можно
+без предположения о наличии флага `--version`:
 
 ```bash
-python3 -c 'from importlib.metadata import version; print(version("maxbridge"))'
-# Дополнительная проверка фактического бинарника и процесса:
-command -v maxbridge
-sudo cat /run/maxbridge/maxbridge.pid
-ps -fp "$(sudo cat /run/maxbridge/maxbridge.pid)"
+.venv/bin/python -c 'from importlib.metadata import version; print(version("maxbridge"))'
 ```
 
-### Безопасное обновление systemd
+### Безопасное обновление checkout
 
 Не используйте `git reset --hard`: он может уничтожить локальные операторские изменения.
 Сначала убедитесь, что checkout чист, затем выполняйте fast-forward update и повторную
@@ -367,36 +355,36 @@ cd /путь/к/maxBridge
 git status --short
 git switch main
 git pull --ff-only
-cd cli
-sudo bash deploy/install.sh
-sudo systemctl restart maxbridge
-sudo systemctl status maxbridge --no-pager
-sudo journalctl -u maxbridge -n 100 --no-pager
+./cli/deploy/install.sh
 ```
 
 Если `git status --short` показывает изменения, остановитесь и сохраните/разберите их до
-обновления; не затирайте их автоматически. Повторный установщик сохраняет production-конфиг.
+обновления; не затирайте их автоматически. Повторный установщик сохраняет локальный конфиг.
 
 ### Диагностика ошибок установщика
 
-Ошибки `src/maxbridge/data/default.yaml: No such file or directory` означают, что команда
-запущена не из `cli` либо на сервер скопирован неполный checkout. Ошибки, упоминающие
-`build_editable`, обычно указывают на старое/неполное дерево или попытку использовать
-неподходящий development-процесс. В обоих случаях обновите `main`, убедитесь, что имеется
-полное дерево репозитория, перейдите в `maxBridge/cli` и повторите установщик:
+Ошибки `src/maxbridge/data/default.yaml: No such file or directory` означают, что на сервер
+скопирован неполный checkout. Убедитесь, что имеются все файлы Python-пакета, и повторите:
 
 ```bash
 cd /путь/к/maxBridge
 git switch main
 git pull --ff-only
-cd cli
-test -f src/maxbridge/data/default.yaml
-test -f pyproject.toml
-sudo bash deploy/install.sh
+test -f cli/src/maxbridge/data/default.yaml
+test -f cli/pyproject.toml
+./cli/deploy/install.sh
 ```
 
-Не копируйте `default.yaml` вручную поверх `/etc/maxbridge/config.yaml` и не удаляйте
-существующий конфиг ради повторного запуска.
+Не копируйте `default.yaml` поверх `cli/config/local.yaml` и не удаляйте существующий
+конфиг ради повторного запуска.
+
+### Опциональная ручная миграция в systemd
+
+Файл `cli/deploy/maxbridge.service` остаётся примером для отдельной осознанной системной
+миграции. Локальный установщик его не копирует и не активирует. Перед переносом checkout,
+бинарника, конфига и состояния в service-каталоги сверьте пути unit с фактическим
+размещением. Сохраняйте существующее legacy-состояние `/etc/maxbridge`; локальная установка
+не требует его удаления. Не запускайте systemd одновременно с локальным процессом или PM2.
 
 ### PM2 — альтернативный supervisor
 
@@ -405,12 +393,9 @@ PM2 допустим вместо systemd, но никогда одноврем�
 (`npm run pm2:delete`, затем `pm2 save`). PM2 запускает демон из локального virtualenv:
 
 ```bash
+./maxBridge/cli/deploy/install.sh
 cd maxBridge/cli
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -e ".[dev]"   # только development/PM2 checkout, не systemd production install
 npm install -g pm2        # один раз
-mkdir -p logs
 npm run pm2:prod
 npm run pm2:status
 npm run pm2:logs
@@ -427,8 +412,7 @@ npm run pm2:save
 
 PM2 пишет логи в `cli/logs/maxbridge-out.log` и
 `cli/logs/maxbridge-error.log`; application PID lock находится в
-`cli/data/maxbridge.pid`. Editable-установка `pip install -e ".[dev]"` предназначена для
-разработки/PM2 checkout и не заменяет production-установку systemd.
+`cli/data/maxbridge.pid`.
 
 ### Ручной запуск
 
@@ -438,7 +422,7 @@ PM2 пишет логи в `cli/logs/maxbridge-out.log` и
 sudo systemctl stop maxbridge
 pm2 delete maxbridge
 cd maxBridge/cli
-nohup python -m maxbridge.main > /dev/null 2>&1 &
+nohup .venv/bin/maxbridge -c config/local.yaml > /dev/null 2>&1 &
 ```
 
 ### Восстановление Telegram polling после 409
