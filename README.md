@@ -73,7 +73,7 @@ maxBridge/
     │   ├── commander.py           ← CLI шелл
     │   ├── config.py              ← Загрузка YAML конфига
     │   └── main.py                ← Демон
-    ├── tests/                     ← 187 юнит-тестов
+    ├── tests/                     ← Юнит-тесты
     ├── examples/                  ← Пример IPC клиента
     ├── deploy/                    ← systemd + install.sh
     └── pyproject.toml
@@ -81,24 +81,32 @@ maxBridge/
 
 ## Установка
 
+Для полной локальной установки из корня checkout:
+
 ```bash
 git clone <repo-url> maxBridge
-cd maxBridge/cli
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -e ".[dev]"
+cd maxBridge
+./cli/deploy/install.sh
 ```
 
-**Требования:** Python 3.10+
+Установщик создаёт `cli/.venv`, устанавливает пакет в этот checkout, а также создаёт
+`cli/config/local.yaml`, `cli/data` и `cli/logs`, не перезаписывая существующий локальный
+конфиг. **Требования:** Python 3.10+.
 
 ## Быстрый старт
 
 ### 1. TUI интерфейс (рекомендуется)
 
+После полной установки запустите TUI из `cli`:
+
 ```bash
-cd maxBridge/cli && source .venv/bin/activate
-maxbridge-tui
+cd cli
+.venv/bin/maxbridge-tui
 ```
+
+Для отдельной TUI-focused wheel-сборки из корня checkout используйте
+`./cli/deploy/build-tui.sh`. Скрипт создаёт или сохраняет тот же локальный конфиг,
+`data` и `logs`, затем печатает точную команду `Start`; запускайте TUI этой командой.
 
 Меню:
 - 🔐 **Сессии** — добавление аккаунтов через QR, переключение активной сессии
@@ -109,19 +117,18 @@ maxbridge-tui
 ### 2. Демон (фоновый сервис)
 
 ```bash
-# Авторизация (QR-код)
-python -m maxbridge.main --auth-only
-
-# Запуск
-python -m maxbridge.main
-
-# Фоновый запуск
-# Допустим только когда systemd и PM2 остановлены.
-nohup python -m maxbridge.main > /dev/null 2>&1 &
-
-# С отладкой
-python -m maxbridge.main --debug
+cd cli
+.venv/bin/maxbridge --auth-only -c config/local.yaml
+.venv/bin/maxbridge -c config/local.yaml
 ```
+
+Для отладки в foreground используйте:
+
+```bash
+.venv/bin/maxbridge --debug -c config/local.yaml 2>&1 | tee logs/maxbridge-debug.log
+```
+
+Не запускайте второй демон из TUI, если текущим демоном уже управляет PM2 или systemd.
 
 ## Авторизация
 
@@ -141,12 +148,12 @@ maxBridge использует **QR-код авторизацию**:
 
 ### Настройка через TUI
 
-1. `maxbridge-tui` → 📨 Telegram
+1. `.venv/bin/maxbridge-tui` → 📨 Telegram
 2. Введите токен бота (`@BotFather` в Telegram)
 3. Введите ID получателя (канал, группа или личный чат)
-4. Нажмите 🧪 Тест — проверьте получение
+4. Нажмите 🧪 Тест — он проверяет только исходящий запрос к Telegram Bot API
 5. Включите переключатель 🟢
-6. Перезапустите демон
+6. Перезапустите уже работающий единственный демон: forwarder читает конфиг при старте.
 
 ### Формат сообщений
 
@@ -227,7 +234,17 @@ daemon:
   pid_file: "/tmp/maxbridge.pid"
 ```
 
-Динамические аккаунты (добавленные через TUI) сохраняются в `data/accounts.json`.
+Конфиг ищется в порядке: явный `-c`, `./config/local.yaml`,
+`~/.config/maxbridge/config.yaml`, `/etc/maxbridge/config.yaml`, встроенный default.
+Поэтому запускайте из `cli` или всегда передавайте `-c config/local.yaml`.
+
+Локальное операторское состояние относительно `cli`: `config/local.yaml` -- основной
+конфиг; `data/telegram.json` -- секретные настройки Telegram; `data/accounts.json` --
+динамические аккаунты; `data/*.session` -- зашифрованные сессии; `data/master.key` -- ключ
+шифрования; `data/active_session.txt` -- выбранная сессия. При PM2 application PID lock --
+`data/maxbridge.pid`; в default-конфиге PID -- `/tmp/maxbridge.pid`. Эти `config/` и
+`data/` являются приватным состоянием оператора: не публикуйте их содержимое и не меняйте
+права на `0644`.
 
 ## IPC API (JSON-RPC 2.0)
 
@@ -281,7 +298,7 @@ socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/maxbridge.sock
 }
 ```
 
-## Production: локальная сборка, установка и запуск
+## Локальная эксплуатация
 
 По умолчанию production-инсталляция остаётся в текущем checkout: установщик собирает пакет
 в `cli/.venv`, создаёт локальный конфиг и каталоги состояния и не меняет систему. systemd,
@@ -300,7 +317,7 @@ pgrep -af '/usr/local/bin/maxbridge|\.venv/bin/maxbridge|maxbridge\.main'
 `daemon.pid_file` и `MAXBRIDGE_DAEMON_PID_FILE` задают application PID lock. Это не
 внутренние PID-файлы PM2 в `PM2_HOME`; настройка PM2 `pid_file` для приложения не нужна.
 
-### Локальная установка (по умолчанию)
+### Полная локальная установка (по умолчанию)
 
 Получите **полный checkout** ветки `main`. Нельзя копировать на сервер только каталог
 `deploy/`: установщику одновременно нужны `deploy/`, `src/`, `pyproject.toml` и остальные
@@ -325,16 +342,18 @@ Development extras необязательны: `INSTALL_DEV=1 ./maxBridge/cli/de
 
 ### Локальная сборка TUI
 
-Для TUI без полного локального установщика используйте отдельную checkout-local сборку:
+Для TUI-focused wheel-сборки без полного локального установщика используйте:
 
 ```bash
 ./cli/deploy/build-tui.sh
-./cli/.venv/bin/maxbridge-tui
 ```
 
-Скрипт собирает wheel в `cli/dist`, устанавливает только этот wheel в `cli/.venv` и выводит
-абсолютные пути к wheel и TUI. В отличие от `install.sh`, он не создаёт конфиг, каталоги
-состояния или daemon-процесс.
+После выполнения скрипт выводит абсолютные пути к wheel и TUI, строки `Config created`
+или `Config preserved`, а также одну готовую команду `Start: (cd ... && exec
+.venv/bin/maxbridge-tui)`. Скопируйте эту команду для запуска. Скрипт не запускает TUI
+и не создаёт daemon-процесс. Новый `config/local.yaml` публикуется атомарно без
+перезаписи существующего пути и получает права ровно `0600`; ошибка установки прав
+останавливает сборку.
 
 ### Конфигурация, авторизация и первый локальный старт
 
@@ -343,8 +362,12 @@ cd maxBridge/cli
 $EDITOR config/local.yaml
 .venv/bin/maxbridge --auth-only -c config/local.yaml
 .venv/bin/maxbridge -c config/local.yaml
-.venv/bin/maxbridge-tui
 ```
+
+Для TUI-focused сборки повторно запустите `./cli/deploy/build-tui.sh` и используйте
+напечатанную им команду `Start`. Локальный `cli/config/local.yaml` используется при
+запуске из `cli`; существующий `/etc/maxbridge/config.yaml` для этого сценария не
+затрагивается и не требуется.
 
 TUI подключается к уже выбранному демону. Переключатель демона в TUI не заменяет systemd
 или PM2: если процесс уже управляется supervisor-ом, не запускайте из TUI второй демон.
@@ -427,7 +450,7 @@ PM2 пишет логи в `cli/logs/maxbridge-out.log` и
 `cli/logs/maxbridge-error.log`; application PID lock находится в
 `cli/data/maxbridge.pid`.
 
-### Ручной запуск
+### Foreground запуск
 
 Ручной запуск разрешён только после остановки systemd и удаления/остановки процесса PM2:
 
@@ -435,8 +458,16 @@ PM2 пишет логи в `cli/logs/maxbridge-out.log` и
 sudo systemctl stop maxbridge
 pm2 delete maxbridge
 cd maxBridge/cli
-nohup .venv/bin/maxbridge -c config/local.yaml > /dev/null 2>&1 &
+.venv/bin/maxbridge --debug -c config/local.yaml 2>&1 | tee logs/maxbridge-debug.log
 ```
+
+После запуска демона кнопкой TUI его stdout/stderr дописываются в
+`cli/logs/maxbridge-tui-daemon.log`; смотреть их можно командой
+`tail -f logs/maxbridge-tui-daemon.log` из `cli`. Для разового разбора остаётся
+foreground-команда выше. После сохранения или включения Telegram-настроек перезапустите
+единственный работающий демон: forwarder читает конфиг при старте. PM2 продолжает писать в
+свои `cli/logs/maxbridge-out.log` и `cli/logs/maxbridge-error.log`; не запускайте TUI-демон,
+когда владельцем процесса уже является PM2 или systemd.
 
 ### Восстановление Telegram polling после 409
 
@@ -463,8 +494,6 @@ operator-triggered restart выбранного единственного super
 cd maxBridge/cli && source .venv/bin/activate
 python -m pytest tests/ -v
 ```
-
-Сейчас в проекте 189 unit-тестов.
 
 ## Лицензия
 

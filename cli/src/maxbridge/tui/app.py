@@ -22,6 +22,25 @@ from maxbridge.tui.screens import ChatListScreen, SessionScreen
 from maxbridge.tui.styles import CYBERPUNK_CSS, LOGO
 
 
+def _daemon_log_path() -> Path:
+    return Path("logs/maxbridge-tui-daemon.log")
+
+
+def _open_daemon_log():
+    log_path = _daemon_log_path()
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(
+        log_path, flags, 0o600
+    )
+    try:
+        os.fchmod(descriptor, 0o600)
+        return os.fdopen(descriptor, "a", encoding="utf-8")
+    except OSError:
+        os.close(descriptor)
+        raise
+
+
 class MaxBridgeTUI(App):
     TITLE = "maxBridge"
     SUB_TITLE = ""
@@ -133,10 +152,19 @@ class MaxBridgeTUI(App):
             except ProcessLookupError:
                 pass
         else:
-            subprocess.Popen(
-                [sys.executable, "-m", "maxbridge.main"],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                start_new_session=True)
+            try:
+                daemon_log = _open_daemon_log()
+            except OSError as exc:
+                self.notify(
+                    f"❌ Не удалось открыть лог демона: {exc}", severity="error"
+                )
+                return
+            try:
+                subprocess.Popen(
+                    [sys.executable, "-m", "maxbridge.main"],
+                    stdout=daemon_log, stderr=daemon_log, start_new_session=True)
+            finally:
+                daemon_log.close()
             self.notify("🚀 Запуск демона...")
         self.set_timer(2, self._update_status)
 

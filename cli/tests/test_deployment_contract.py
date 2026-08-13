@@ -2,6 +2,7 @@
 
 import os
 import pathlib
+import shlex
 import shutil
 import stat
 import subprocess
@@ -95,6 +96,8 @@ def test_installer_creates_and_preserves_local_state_from_arbitrary_cwd(tmp_path
 def test_tui_builder_builds_and_installs_one_checkout_local_wheel_from_arbitrary_cwd(tmp_path):
     checkout = tmp_path / "checkout" / "cli"
     (checkout / "deploy").mkdir(parents=True)
+    (checkout / "src/maxbridge/data").mkdir(parents=True)
+    (checkout / "src/maxbridge/data/default.yaml").write_text("marker: default\n", encoding="utf-8")
     shutil.copy2(TUI_BUILDER, checkout / "deploy/build-tui.sh")
     (checkout / "dist").mkdir()
     (checkout / "dist/maxbridge-stale.whl").write_text("stale\n", encoding="utf-8")
@@ -111,7 +114,7 @@ def test_tui_builder_builds_and_installs_one_checkout_local_wheel_from_arbitrary
         "    printf '%s\\n' \"$*\" >> pip-calls\n"
         "    if [ \"$3\" = \"wheel\" ]; then\n"
         "        mkdir -p dist\n"
-        "        : > dist/maxbridge-0.1.7-py3-none-any.whl\n"
+        "        : > dist/maxbridge-0.1.9-py3-none-any.whl\n"
         "    fi\n"
         "    if [ \"$3\" = \"install\" ]; then\n"
         "        printf '#!/bin/sh\\ntouch tui-started\\n' > .venv/bin/maxbridge-tui\n"
@@ -132,7 +135,7 @@ def test_tui_builder_builds_and_installs_one_checkout_local_wheel_from_arbitrary
         text=True,
     )
 
-    wheel = checkout / "dist/maxbridge-0.1.7-py3-none-any.whl"
+    wheel = checkout / "dist/maxbridge-0.1.9-py3-none-any.whl"
     tui = checkout / ".venv/bin/maxbridge-tui"
     assert not (checkout / "dist/maxbridge-stale.whl").exists()
     assert (checkout / "pip-calls").read_text(encoding="utf-8").splitlines() == [
@@ -142,8 +145,177 @@ def test_tui_builder_builds_and_installs_one_checkout_local_wheel_from_arbitrary
     assert tui.is_file() and os.access(tui, os.X_OK)
     assert f"Wheel: {wheel}" in result.stdout
     assert f"TUI:   {tui}" in result.stdout
+    config = checkout / "config/local.yaml"
+    assert config.read_text(encoding="utf-8") == "marker: default\n"
+    assert stat.S_IMODE(config.stat().st_mode) == 0o600
+    assert (checkout / "data").is_dir()
+    assert (checkout / "logs").is_dir()
+    assert f"Config created: {config}" in result.stdout
+    start_root = shlex.quote(str(checkout))
+    assert f"Start: (cd {start_root} && exec .venv/bin/maxbridge-tui)" in result.stdout
     assert "maxbridge-tui" not in (checkout / "pip-calls").read_text(encoding="utf-8")
     assert not (checkout / "tui-started").exists()
+
+
+def test_tui_builder_preserves_existing_config_and_reports_start_from_cli(tmp_path):
+    checkout = tmp_path / "checkout" / "cli"
+    (checkout / "deploy").mkdir(parents=True)
+    (checkout / "src/maxbridge/data").mkdir(parents=True)
+    (checkout / "src/maxbridge/data/default.yaml").write_text("marker: default\n", encoding="utf-8")
+    (checkout / "config").mkdir()
+    config = checkout / "config/local.yaml"
+    config.write_bytes(b"marker: operator\n")
+    shutil.copy2(TUI_BUILDER, checkout / "deploy/build-tui.sh")
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_python = fake_bin / "python3"
+    fake_python.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = \"-m\" ] && [ \"$2\" = \"venv\" ]; then\n"
+        "    mkdir -p .venv/bin\n"
+        "    cp \"$0\" .venv/bin/python\n"
+        "elif [ \"$3\" = \"wheel\" ]; then\n"
+        "    mkdir -p dist\n"
+        "    : > dist/maxbridge-0.1.9-py3-none-any.whl\n"
+        "elif [ \"$3\" = \"install\" ]; then\n"
+        "    printf '#!/bin/sh\\n' > .venv/bin/maxbridge-tui\n"
+        "    chmod +x .venv/bin/maxbridge-tui\n"
+        "fi\n",
+        encoding="utf-8",
+    )
+    fake_python.chmod(fake_python.stat().st_mode | stat.S_IXUSR)
+
+    result = subprocess.run(
+        ["bash", str(checkout / "deploy/build-tui.sh")],
+        cwd=tmp_path,
+        env={**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}"},
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert config.read_bytes() == b"marker: operator\n"
+    assert f"Config preserved: {config}" in result.stdout
+    start_root = shlex.quote(str(checkout))
+    assert f"Start: (cd {start_root} && exec .venv/bin/maxbridge-tui)" in result.stdout
+
+    config.write_bytes(b"marker: rerun\n")
+    second = subprocess.run(
+        ["bash", str(checkout / "deploy/build-tui.sh")],
+        cwd=tmp_path,
+        env={**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}"},
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert config.read_bytes() == b"marker: rerun\n"
+    assert f"Config preserved: {config}" in second.stdout
+
+    config.unlink()
+    config.symlink_to("missing-operator-config.yaml")
+    third = subprocess.run(
+        ["bash", str(checkout / "deploy/build-tui.sh")],
+        cwd=tmp_path,
+        env={**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}"},
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert config.is_symlink()
+    assert os.readlink(config) == "missing-operator-config.yaml"
+    assert f"Config preserved: {config}" in third.stdout
+
+
+def test_tui_builder_preserves_config_created_during_atomic_publish(tmp_path):
+    checkout = tmp_path / "checkout" / "cli"
+    (checkout / "deploy").mkdir(parents=True)
+    (checkout / "src/maxbridge/data").mkdir(parents=True)
+    (checkout / "src/maxbridge/data/default.yaml").write_text("marker: default\n", encoding="utf-8")
+    shutil.copy2(TUI_BUILDER, checkout / "deploy/build-tui.sh")
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_python = fake_bin / "python3"
+    fake_python.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = \"-m\" ] && [ \"$2\" = \"venv\" ]; then\n"
+        "    mkdir -p .venv/bin\n"
+        "    cp \"$0\" .venv/bin/python\n"
+        "elif [ \"$3\" = \"wheel\" ]; then\n"
+        "    mkdir -p dist\n"
+        "    : > dist/maxbridge-0.1.9-py3-none-any.whl\n"
+        "elif [ \"$3\" = \"install\" ]; then\n"
+        "    printf '#!/bin/sh\\n' > .venv/bin/maxbridge-tui\n"
+        "    chmod +x .venv/bin/maxbridge-tui\n"
+        "fi\n",
+        encoding="utf-8",
+    )
+    fake_python.chmod(fake_python.stat().st_mode | stat.S_IXUSR)
+    fake_ln = fake_bin / "ln"
+    fake_ln.write_text(
+        "#!/bin/sh\n"
+        "printf 'marker: racer\\n' > \"$3\"\n"
+        "chmod 0640 \"$3\"\n"
+        "echo 'simulated destination collision' >&2\n"
+        "exit 1\n",
+        encoding="utf-8",
+    )
+    fake_ln.chmod(fake_ln.stat().st_mode | stat.S_IXUSR)
+
+    result = subprocess.run(
+        ["bash", str(checkout / "deploy/build-tui.sh")],
+        cwd=tmp_path,
+        env={**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}"},
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    config = checkout / "config/local.yaml"
+    assert config.read_bytes() == b"marker: racer\n"
+    assert stat.S_IMODE(config.stat().st_mode) == 0o640
+    assert f"Config preserved: {config}" in result.stdout
+    assert not list((checkout / "config").glob(".local.yaml.tmp.*"))
+
+
+def test_tui_builder_fails_closed_and_cleans_temp_when_chmod_fails(tmp_path):
+    checkout = tmp_path / "checkout" / "cli"
+    (checkout / "deploy").mkdir(parents=True)
+    (checkout / "src/maxbridge/data").mkdir(parents=True)
+    (checkout / "src/maxbridge/data/default.yaml").write_text("marker: default\n", encoding="utf-8")
+    shutil.copy2(TUI_BUILDER, checkout / "deploy/build-tui.sh")
+    (checkout / ".venv/bin").mkdir(parents=True)
+    fake_venv_python = checkout / ".venv/bin/python"
+    fake_venv_python.write_text("#!/bin/sh\ntouch python-ran\n", encoding="utf-8")
+    fake_venv_python.chmod(fake_venv_python.stat().st_mode | stat.S_IXUSR)
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_chmod = fake_bin / "chmod"
+    fake_chmod.write_text(
+        "#!/bin/sh\n"
+        "echo 'simulated chmod failure' >&2\n"
+        "exit 1\n",
+        encoding="utf-8",
+    )
+    fake_chmod.chmod(fake_chmod.stat().st_mode | stat.S_IXUSR)
+
+    result = subprocess.run(
+        ["bash", str(checkout / "deploy/build-tui.sh")],
+        cwd=tmp_path,
+        env={**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}"},
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "simulated chmod failure" in result.stderr
+    assert "Failed to set mode 0600" in result.stderr
+    assert not (checkout / "config/local.yaml").exists()
+    assert not list((checkout / "config").glob(".local.yaml.tmp.*"))
+    assert not (checkout / "python-ran").exists()
 
 
 def test_tui_builder_is_local_only_and_noninteractive():
