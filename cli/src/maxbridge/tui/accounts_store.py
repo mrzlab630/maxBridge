@@ -20,14 +20,28 @@ def load_accounts(config_accounts: dict[str, Any],
     """
     result = dict(config_accounts)
     p = Path(store_path)
-    if p.exists():
-        try:
-            stored = json.loads(p.read_text(encoding="utf-8"))
-            for aid, cfg in stored.items():
-                if aid not in result:
-                    result[aid] = cfg
-        except (json.JSONDecodeError, OSError) as e:
-            logger.warning("Ошибка чтения %s: %s", store_path, e)
+    try:
+        stored = json.loads(p.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return result
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
+        logger.warning(
+            "Unable to load dynamic account store %s (%s)",
+            store_path,
+            type(exc).__name__,
+        )
+        return result
+
+    if not isinstance(stored, dict):
+        logger.warning("Ignoring dynamic account store %s with invalid root", store_path)
+        return result
+
+    for aid, cfg in stored.items():
+        if not isinstance(cfg, dict):
+            logger.warning("Ignoring invalid dynamic account entry in %s", store_path)
+            continue
+        if aid not in result:
+            result[aid] = cfg
     return result
 
 

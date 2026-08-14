@@ -7,8 +7,12 @@ import pytest
 
 import maxbridge.main as main_module
 from maxbridge.bridge.event_bus import EventBus
-from maxbridge.config import load_config
-from maxbridge.main import MaxBridgeDaemon, _drain_background_tasks
+from maxbridge.config import ResolvedConfig, load_config
+from maxbridge.main import (
+    MaxBridgeDaemon,
+    _drain_background_tasks,
+    _register_configured_accounts,
+)
 from maxbridge.telegram import forwarder as forwarder_module
 from maxbridge.telegram.config import TelegramConfig, save_telegram_config
 from maxbridge.telegram.forwarder import TelegramForwarder
@@ -170,3 +174,26 @@ def test_cli_passes_resolved_checkout_paths_to_daemon(tmp_path, monkeypatch):
     assert resolved.runtime_root == checkout
     assert resolved.telegram_config_path == checkout / "data" / "telegram.json"
     main_module.os.chdir.assert_called_once_with(checkout)
+
+
+def test_register_accounts_loads_dynamic_store_with_config_priority(tmp_path):
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "accounts.json").write_text(
+        '{"default": {"session_file": "data/dynamic-default.session"}, '
+        '"account_2": {"session_file": "data/account_2.session"}}',
+        encoding="utf-8",
+    )
+    config = ResolvedConfig(
+        {"accounts": {"default": {"session_file": "data/default.session"}}},
+        source_path=None,
+        runtime_root=tmp_path,
+    )
+    manager = MagicMock()
+
+    _register_configured_accounts(manager, config)
+
+    assert manager.add_account.call_args_list == [
+        (("default", {"session_file": "data/default.session"}),),
+        (("account_2", {"session_file": "data/account_2.session"}),),
+    ]

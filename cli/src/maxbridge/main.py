@@ -24,6 +24,7 @@ from maxbridge.protocol.errors import MaxApiError, MaxConnectionError
 from maxbridge.telegram.config import load_telegram_config_snapshot, telegram_config_path
 from maxbridge.telegram.control_bot import TelegramControlBot
 from maxbridge.telegram.forwarder import TelegramForwarder
+from maxbridge.tui.accounts_store import load_accounts
 from maxbridge.utils.constants import Opcode
 from maxbridge.utils.logger import redact_secrets, setup_error_logging, setup_logging
 
@@ -58,7 +59,9 @@ def _register_configured_accounts(manager: AccountManager, config: dict) -> None
         max_cfg = config.get("max", {})
         if max_cfg:
             accounts_cfg = {"default": max_cfg}
-    for account_id, acc_config in accounts_cfg.items():
+    runtime_root = Path(getattr(config, "runtime_root", Path.cwd()))
+    all_accounts = load_accounts(accounts_cfg, runtime_root / "data" / "accounts.json")
+    for account_id, acc_config in all_accounts.items():
         manager.add_account(account_id, acc_config)
 
 

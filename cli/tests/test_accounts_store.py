@@ -18,6 +18,22 @@ class TestAccountsStore:
         result = load_accounts({"default": {}}, path)
         assert "default" in result
 
+    def test_load_invalid_store_preserves_config_accounts(self, tmp_dir):
+        path = os.path.join(tmp_dir, "acc.json")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("[]")
+
+        assert load_accounts({"default": {"phone": "123"}}, path) == {
+            "default": {"phone": "123"},
+        }
+
+    def test_load_ignores_invalid_dynamic_entry(self, tmp_dir):
+        path = os.path.join(tmp_dir, "acc.json")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write('{"invalid": "not-an-account", "valid": {}}')
+
+        assert load_accounts({}, path) == {"valid": {}}
+
     def test_save_and_load_dynamic(self, tmp_dir):
         path = os.path.join(tmp_dir, "acc.json")
         config_accounts = {"default": {"phone": "123"}}
