@@ -114,7 +114,7 @@ def test_tui_builder_builds_and_installs_one_checkout_local_wheel_from_arbitrary
         "    printf '%s\\n' \"$*\" >> pip-calls\n"
         "    if [ \"$3\" = \"wheel\" ]; then\n"
         "        mkdir -p dist\n"
-        "        : > dist/maxbridge-0.1.11-py3-none-any.whl\n"
+        "        : > dist/maxbridge-0.1.12-py3-none-any.whl\n"
         "    fi\n"
         "    if [ \"$3\" = \"install\" ]; then\n"
         "        printf '#!/bin/sh\\ntouch tui-started\\n' > .venv/bin/maxbridge-tui\n"
@@ -135,7 +135,7 @@ def test_tui_builder_builds_and_installs_one_checkout_local_wheel_from_arbitrary
         text=True,
     )
 
-    wheel = checkout / "dist/maxbridge-0.1.11-py3-none-any.whl"
+    wheel = checkout / "dist/maxbridge-0.1.12-py3-none-any.whl"
     tui = checkout / ".venv/bin/maxbridge-tui"
     assert not (checkout / "dist/maxbridge-stale.whl").exists()
     assert (checkout / "pip-calls").read_text(encoding="utf-8").splitlines() == [
@@ -177,7 +177,7 @@ def test_tui_builder_preserves_existing_config_and_reports_start_from_cli(tmp_pa
         "    cp \"$0\" .venv/bin/python\n"
         "elif [ \"$3\" = \"wheel\" ]; then\n"
         "    mkdir -p dist\n"
-        "    : > dist/maxbridge-0.1.11-py3-none-any.whl\n"
+        "    : > dist/maxbridge-0.1.12-py3-none-any.whl\n"
         "elif [ \"$3\" = \"install\" ]; then\n"
         "    printf '#!/bin/sh\\n' > .venv/bin/maxbridge-tui\n"
         "    chmod +x .venv/bin/maxbridge-tui\n"
@@ -244,7 +244,7 @@ def test_tui_builder_preserves_config_created_during_atomic_publish(tmp_path):
         "    cp \"$0\" .venv/bin/python\n"
         "elif [ \"$3\" = \"wheel\" ]; then\n"
         "    mkdir -p dist\n"
-        "    : > dist/maxbridge-0.1.11-py3-none-any.whl\n"
+        "    : > dist/maxbridge-0.1.12-py3-none-any.whl\n"
         "elif [ \"$3\" = \"install\" ]; then\n"
         "    printf '#!/bin/sh\\n' > .venv/bin/maxbridge-tui\n"
         "    chmod +x .venv/bin/maxbridge-tui\n"
