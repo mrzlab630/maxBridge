@@ -19,10 +19,11 @@ from maxbridge.utils.types import LinkedMessage, MessageStatus, UnifiedMessage
 
 def _msg(text="hi", sender_name="Иван", chat_name="Общий", message_id="m1",
          status=MessageStatus.NEW, attachments=None,
-         link_type=None, link_chat_id=None, linked_message=None):
+         link_type=None, link_chat_id=None, linked_message=None,
+         account_id="default", chat_id=123):
     return UnifiedMessage(
-        account_id="default",
-        chat_id=123,
+        account_id=account_id,
+        chat_id=chat_id,
         message_id=message_id,
         status=status,
         text=text,
@@ -174,14 +175,19 @@ class TestMessageCoalescing:
         return fw
 
     @pytest.mark.asyncio
-    async def test_concurrent_duplicate_uses_enriched_header_once(self, monkeypatch):
+    async def test_sequential_duplicate_within_window_uses_enriched_header_once(
+        self, monkeypatch
+    ):
         fw = self._make_ready_forwarder()
-        monkeypatch.setattr(forwarder_module, "_COALESCE_WINDOW", 0)
+        monkeypatch.setattr(forwarder_module, "_COALESCE_WINDOW", 0.08)
         fw._send_text = AsyncMock(return_value=True)
         raw = _msg(sender_name=None, chat_name=None)
         enriched = _msg(sender_name="Степан", chat_name="DM")
 
-        await asyncio.gather(fw._on_message(raw), fw._on_message(enriched))
+        delivery = asyncio.create_task(fw._on_message(raw))
+        await asyncio.sleep(0.05)
+        await fw._on_message(enriched)
+        await delivery
 
         fw._send_text.assert_awaited_once()
         text = fw._send_text.await_args.args[0]
@@ -189,9 +195,51 @@ class TestMessageCoalescing:
         assert "DM" in text
 
     @pytest.mark.asyncio
+    async def test_delivered_duplicate_is_suppressed_until_ttl_expires(
+        self, monkeypatch
+    ):
+        fw = self._make_ready_forwarder()
+        monkeypatch.setattr(forwarder_module, "_COALESCE_WINDOW", 0.01)
+        fw._send_text = AsyncMock(return_value=True)
+        raw = _msg(sender_name=None, chat_name=None)
+        enriched = _msg(sender_name="Степан", chat_name="DM")
+
+        await fw._on_message(raw)
+        await fw._on_message(enriched)
+
+        fw._send_text.assert_awaited_once()
+        identity = fw._message_identity(raw)
+        assert identity in fw._coalescing_delivered
+
+        fw._coalescing_delivered[identity] = 0.0
+        await fw._on_message(enriched)
+
+        assert fw._send_text.await_count == 2
+        assert "Степан" in fw._send_text.await_args.args[0]
+
+    @pytest.mark.asyncio
+    async def test_failed_send_can_be_claimed_and_retried(self, monkeypatch):
+        fw = self._make_ready_forwarder()
+        monkeypatch.setattr(forwarder_module, "_COALESCE_WINDOW", 0.01)
+        fw._send_text = AsyncMock(side_effect=[False, True])
+        msg = _msg()
+        identity = fw._message_identity(msg)
+
+        await fw._on_message(msg)
+
+        assert fw._send_text.await_count == 1
+        assert identity not in fw._coalescing_delivered
+        assert identity not in fw._coalescing_pending
+
+        await fw._on_message(msg)
+
+        assert fw._send_text.await_count == 2
+        assert identity in fw._coalescing_delivered
+
+    @pytest.mark.asyncio
     async def test_distinct_message_ids_both_forward(self, monkeypatch):
         fw = self._make_ready_forwarder()
-        monkeypatch.setattr(forwarder_module, "_COALESCE_WINDOW", 0)
+        monkeypatch.setattr(forwarder_module, "_COALESCE_WINDOW", 0.001)
         fw._send_text = AsyncMock(return_value=True)
 
         await asyncio.gather(
@@ -204,7 +252,7 @@ class TestMessageCoalescing:
     @pytest.mark.asyncio
     async def test_same_id_with_different_text_both_forward(self, monkeypatch):
         fw = self._make_ready_forwarder()
-        monkeypatch.setattr(forwarder_module, "_COALESCE_WINDOW", 0)
+        monkeypatch.setattr(forwarder_module, "_COALESCE_WINDOW", 0.001)
         fw._send_text = AsyncMock(return_value=True)
 
         await asyncio.gather(
@@ -217,7 +265,7 @@ class TestMessageCoalescing:
     @pytest.mark.asyncio
     async def test_same_id_with_different_status_both_forward(self, monkeypatch):
         fw = self._make_ready_forwarder()
-        monkeypatch.setattr(forwarder_module, "_COALESCE_WINDOW", 0)
+        monkeypatch.setattr(forwarder_module, "_COALESCE_WINDOW", 0.001)
         fw._send_text = AsyncMock(return_value=True)
 
         await asyncio.gather(
@@ -242,7 +290,7 @@ class TestMessageCoalescing:
     @pytest.mark.asyncio
     async def test_delayed_attachment_content_is_not_coalesced(self, monkeypatch):
         fw = self._make_ready_forwarder()
-        monkeypatch.setattr(forwarder_module, "_COALESCE_WINDOW", 0)
+        monkeypatch.setattr(forwarder_module, "_COALESCE_WINDOW", 0.001)
         fw._send_text = AsyncMock(return_value=True)
         fw._send_media_items = AsyncMock(return_value=(1, []))
         text_only = _msg(text="file incoming")
@@ -259,23 +307,60 @@ class TestMessageCoalescing:
         fw._send_media_items.assert_awaited_once()
         fw._send_text.assert_awaited_once()
 
-    def test_coalescing_cache_expires_and_stays_bounded(self, monkeypatch):
+    def test_identity_includes_routing_status_and_compact_content_digest(self):
+        fw = self._make_ready_forwarder()
+        base = fw._message_identity(_msg())
+        variants = {
+            fw._message_identity(_msg(account_id="other")),
+            fw._message_identity(_msg(chat_id=456)),
+            fw._message_identity(_msg(message_id="other")),
+            fw._message_identity(_msg(status=MessageStatus.EDITED)),
+            fw._message_identity(_msg(text="other")),
+            fw._message_identity(
+                _msg(attachments=[{"type": "PHOTO", "data": {"baseUrl": "x"}}])
+            ),
+        }
+
+        assert base is not None
+        assert len(base[-1]) == 32
+        assert base not in variants
+        assert len(variants) == 6
+
+    def test_delivered_cache_expires_and_stays_bounded(self, monkeypatch):
         fw = self._make_ready_forwarder()
         clock = [100.0]
         monkeypatch.setattr(forwarder_module.time, "monotonic", lambda: clock[0])
+        monkeypatch.setattr(forwarder_module, "_DELIVERED_MAX_ENTRIES", 2)
 
-        first = _msg(message_id="first")
-        assert fw._claim_message(fw._message_identity(first), first)
-        assert not fw._claim_message(fw._message_identity(first), first)
-        for index in range(forwarder_module._COALESCE_MAX_ENTRIES + 1):
-            msg = _msg(message_id=f"bounded-{index}")
-            assert fw._claim_message(fw._message_identity(msg), msg)
+        identities = [
+            fw._message_identity(_msg(message_id=f"delivered-{index}"))
+            for index in range(3)
+        ]
+        for identity in identities:
+            assert identity is not None
+            fw._mark_delivered(identity)
 
-        assert len(fw._coalescing_seen) == forwarder_module._COALESCE_MAX_ENTRIES
-        clock[0] += forwarder_module._COALESCE_TTL + 1
-        fw._prune_coalescing()
-        assert fw._coalescing_seen == {}
-        assert fw._coalescing_pending == {}
+        assert len(fw._coalescing_delivered) == 2
+        assert identities[0] not in fw._coalescing_delivered
+        clock[0] += forwarder_module._DELIVERED_TTL + 1
+        fw._prune_delivered()
+        assert fw._coalescing_delivered == {}
+
+    @pytest.mark.asyncio
+    async def test_pending_capacity_fails_open_for_unique_message(self, monkeypatch):
+        fw = self._make_ready_forwarder()
+        monkeypatch.setattr(forwarder_module, "_PENDING_MAX_ENTRIES", 1)
+        fw._send_text = AsyncMock(return_value=True)
+        blocker = _msg(message_id="blocker")
+        blocker_identity = fw._message_identity(blocker)
+        assert blocker_identity is not None
+        assert fw._claim_message(blocker_identity, blocker)[0]
+
+        await fw._on_message(_msg(message_id="overflow"))
+
+        fw._send_text.assert_awaited_once()
+        assert list(fw._coalescing_pending) == [blocker_identity]
+        assert fw._coalescing_delivered == {}
 
     @pytest.mark.asyncio
     async def test_stop_invalidates_waiting_coalesced_delivery(self, monkeypatch):
@@ -291,6 +376,43 @@ class TestMessageCoalescing:
         await delivery
 
         fw._send_text.assert_not_awaited()
+        assert fw._coalescing_pending == {}
+        assert fw._coalescing_delivered == {}
+
+    @pytest.mark.asyncio
+    async def test_reload_invalidates_waiting_owner_and_allows_new_generation(
+        self, tmp_path, monkeypatch
+    ):
+        fw, _bus, path = _forwarder(
+            tmp_path,
+            monkeypatch,
+            TelegramConfig(enabled=True, bot_token="old-token", chat_id="chat"),
+        )
+        await fw.start()
+        monkeypatch.setattr(forwarder_module, "_COALESCE_WINDOW", 0.03)
+        fw._send_text = AsyncMock(return_value=True)
+
+        stale_delivery = asyncio.create_task(fw._on_message(_msg()))
+        await asyncio.sleep(0)
+        save_telegram_config(
+            TelegramConfig(enabled=True, bot_token="new-token", chat_id="chat"),
+            path,
+        )
+        assert await fw.reload(load_telegram_config_snapshot(path)) is True
+        await stale_delivery
+
+        fw._send_text.assert_not_awaited()
+        assert fw._coalescing_pending == {}
+        assert fw._coalescing_delivered == {}
+
+        await fw._on_message(_msg())
+
+        fw._send_text.assert_awaited_once()
+        await fw.stop()
+
+    def test_default_windows_are_practical(self):
+        assert forwarder_module._COALESCE_WINDOW >= 0.5
+        assert forwarder_module._DELIVERED_TTL >= 5 * 60
 
 
 class TestEscapeHtml:

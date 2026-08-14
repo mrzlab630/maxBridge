@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import aiohttp
@@ -28,9 +29,18 @@ _FILE_LIMIT = 50 * 1024 * 1024
 _MAX_CAPTION = 1024
 _MAX_TEXT = 4096
 _MAX_ALERT_BODY = 3800
-_COALESCE_WINDOW = 0.05
-_COALESCE_TTL = 10.0
-_COALESCE_MAX_ENTRIES = 512
+_COALESCE_WINDOW = 0.5
+_DELIVERED_TTL = 5 * 60.0
+_PENDING_MAX_ENTRIES = 512
+_DELIVERED_MAX_ENTRIES = 2048
+
+_MessageIdentity = tuple[str, int, str, str, bytes]
+
+
+@dataclass(slots=True)
+class _PendingMessage:
+    generation: int
+    message: UnifiedMessage
 
 
 class TelegramLogHandler(logging.Handler):
@@ -67,10 +77,8 @@ class TelegramForwarder:
         self._observed_fingerprint: str | None = None
         self._reload_lock = asyncio.Lock()
         self._multi = len(account_manager.account_ids) > 1
-        self._coalescing_seen: dict[tuple[str, int, str, str, str], float] = {}
-        self._coalescing_pending: dict[
-            tuple[str, int, str, str, str], UnifiedMessage
-        ] = {}
+        self._coalescing_pending: dict[_MessageIdentity, _PendingMessage] = {}
+        self._coalescing_delivered: dict[_MessageIdentity, float] = {}
         self._coalescing_generation = 0
 
     async def start(self) -> None:
@@ -86,7 +94,7 @@ class TelegramForwarder:
     async def _deactivate(self, *, close_http: bool = True) -> None:
         self._coalescing_generation += 1
         self._coalescing_pending.clear()
-        self._coalescing_seen.clear()
+        self._coalescing_delivered.clear()
         if self._bus.has_subscriber(_SUB_ID):
             self._bus.unsubscribe(_SUB_ID)
         if close_http and self._http and not self._http.closed:
@@ -175,79 +183,115 @@ class TelegramForwarder:
             return
 
         identity = self._message_identity(msg)
-        if identity is not None:
-            generation = self._coalescing_generation
-            if not self._claim_message(identity, msg):
+        if identity is None:
+            await self._forward_message(msg)
+            return
+
+        should_forward, generation = self._claim_message(identity, msg)
+        if not should_forward:
+            return
+        if generation is None:
+            # Pending overload fails open: deliver without dedup state.
+            await self._forward_message(msg)
+            return
+
+        try:
+            await asyncio.sleep(_COALESCE_WINDOW)
+            pending = self._coalescing_pending.get(identity)
+            if (
+                generation != self._coalescing_generation
+                or pending is None
+                or pending.generation != generation
+                or not self._config
+                or not self._http
+                or self._http.closed
+            ):
                 return
-            try:
-                await asyncio.sleep(_COALESCE_WINDOW)
-                if (
-                    generation != self._coalescing_generation
-                    or not self._config
-                    or not self._http
-                    or self._http.closed
-                ):
-                    return
-                msg = self._coalescing_pending.get(identity, msg)
-            finally:
+            delivered = await self._forward_message(pending.message)
+            current = self._coalescing_pending.get(identity)
+            if (
+                delivered
+                and generation == self._coalescing_generation
+                and current is pending
+            ):
+                self._mark_delivered(identity)
+        finally:
+            current = self._coalescing_pending.get(identity)
+            if current is not None and current.generation == generation:
                 self._coalescing_pending.pop(identity, None)
 
+    async def _forward_message(self, msg: UnifiedMessage) -> bool:
+        """Forward one MAX message and report confirmed Telegram delivery."""
+        if not self._config or not self._http or self._http.closed:
+            return False
         media_items = self._collect_media(msg)
 
         if media_items:
             sent_count, failed = await self._send_media_items(media_items, msg)
             if sent_count == len(media_items):
-                return
+                return True
             if failed:
-                await self._send_text(self._format_failed_attachments(msg, failed))
-                return
+                return await self._send_text(
+                    self._format_failed_attachments(msg, failed)
+                )
         elif self._has_non_control_attachments(msg):
             self._log_unforwardable_attachments(msg)
 
         # Fallback: текст
         text = self._format_full(msg)
-        await self._send_text(text)
+        return await self._send_text(text)
 
     def _claim_message(
         self,
-        identity: tuple[str, int, str, str, str],
+        identity: _MessageIdentity,
         msg: UnifiedMessage,
-    ) -> bool:
-        """Claim a message identity before any await and keep the cache bounded."""
+    ) -> tuple[bool, int | None]:
+        """Return whether to forward and the tracked pending generation, if any."""
         now = time.monotonic()
-        self._prune_coalescing(now)
-        if identity in self._coalescing_seen:
-            previous = self._coalescing_pending.get(identity)
-            if (
-                previous is not None
-                and self._enrichment_score(msg) > self._enrichment_score(previous)
-            ):
-                self._coalescing_pending[identity] = msg
-            return False
+        self._prune_delivered(now)
+        if identity in self._coalescing_delivered:
+            return False, None
 
-        if len(self._coalescing_seen) >= _COALESCE_MAX_ENTRIES:
-            oldest = next(iter(self._coalescing_seen))
-            self._coalescing_seen.pop(oldest, None)
-            self._coalescing_pending.pop(oldest, None)
-        self._coalescing_seen[identity] = now + _COALESCE_TTL
-        self._coalescing_pending[identity] = msg
-        return True
+        pending = self._coalescing_pending.get(identity)
+        if pending is not None:
+            if self._enrichment_score(msg) > self._enrichment_score(pending.message):
+                pending.message = msg
+            return False, None
 
-    def _prune_coalescing(self, now: float | None = None) -> None:
+        if len(self._coalescing_pending) >= _PENDING_MAX_ENTRIES:
+            return True, None
+
+        generation = self._coalescing_generation
+        self._coalescing_pending[identity] = _PendingMessage(generation, msg)
+        return True, generation
+
+    def _mark_delivered(self, identity: _MessageIdentity) -> None:
+        now = time.monotonic()
+        self._prune_delivered(now)
+        if _DELIVERED_MAX_ENTRIES <= 0:
+            return
+        if len(self._coalescing_delivered) >= _DELIVERED_MAX_ENTRIES:
+            oldest = next(iter(self._coalescing_delivered))
+            self._coalescing_delivered.pop(oldest, None)
+        self._coalescing_delivered[identity] = now + _DELIVERED_TTL
+
+    def _prune_delivered(self, now: float | None = None) -> None:
         now = time.monotonic() if now is None else now
-        expired = [key for key, deadline in self._coalescing_seen.items() if deadline <= now]
+        expired = [
+            key
+            for key, deadline in self._coalescing_delivered.items()
+            if deadline <= now
+        ]
         for key in expired:
-            self._coalescing_seen.pop(key, None)
-            self._coalescing_pending.pop(key, None)
-        while len(self._coalescing_seen) > _COALESCE_MAX_ENTRIES:
-            oldest = next(iter(self._coalescing_seen))
-            self._coalescing_seen.pop(oldest, None)
-            self._coalescing_pending.pop(oldest, None)
+            self._coalescing_delivered.pop(key, None)
+        while len(self._coalescing_delivered) > _DELIVERED_MAX_ENTRIES:
+            oldest = next(iter(self._coalescing_delivered))
+            self._coalescing_delivered.pop(oldest, None)
 
     @staticmethod
     def _message_identity(
         msg: UnifiedMessage,
-    ) -> tuple[str, int, str, str, str] | None:
+    ) -> _MessageIdentity | None:
         message_id = str(msg.message_id or "").strip()
         if not message_id:
             return None
@@ -267,7 +311,7 @@ class TelegramForwarder:
             separators=(",", ":"),
             default=str,
         ).encode("utf-8")
-        digest = hashlib.sha256(encoded).hexdigest()
+        digest = hashlib.sha256(encoded).digest()
         return (str(msg.account_id), msg.chat_id, message_id, msg.status.value, digest)
 
     @staticmethod
@@ -793,6 +837,8 @@ class TelegramForwarder:
                             file_bytes: bytes, filename: str,
                             caption: str) -> bool:
         """Отправить файл в Telegram."""
+        if not self._config or not self._http or self._http.closed:
+            return False
         form = aiohttp.FormData()
         form.add_field("chat_id", self._config.chat_id)
         form.add_field(field, file_bytes, filename=filename)
@@ -816,7 +862,7 @@ class TelegramForwarder:
     # ── Отправка текста ─────────────────────────────────
 
     async def _send_text(self, text: str) -> bool:
-        if not self._config or not self._http:
+        if not self._config or not self._http or self._http.closed:
             return False
         api = _API.format(token=self._config.bot_token,
                           method="sendMessage")
