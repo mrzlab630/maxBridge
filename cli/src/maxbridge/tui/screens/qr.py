@@ -16,6 +16,7 @@ from maxbridge.auth.qr_auth import complete_qr_auth, request_qr_session
 from maxbridge.auth.session import Session
 from maxbridge.protocol.max_client import MaxClient
 from maxbridge.tui.styles import CYBERPUNK_CSS
+from maxbridge.utils.logger import redact_secrets
 
 logger = logging.getLogger("maxbridge.tui.qr")
 
@@ -104,9 +105,12 @@ class QRScreen(ModalScreen[bool]):
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
-                    logger.warning("QR status check failed for '%s': %s", self._aid, exc)
+                    logger.exception(
+                        "QR status check failed for account '%s'", self._aid
+                    )
                     status.update(
-                        f"[yellow]⚠️ Ошибка проверки QR: {escape(str(exc))}. Повторяем...[/yellow]"
+                        "[yellow]⚠️ Ошибка проверки QR: "
+                        f"{escape(redact_secrets(exc))}. Повторяем...[/yellow]"
                     )
                     continue
 
@@ -128,7 +132,13 @@ class QRScreen(ModalScreen[bool]):
                     st.get("error") if isinstance(st, dict) else None
                 )
                 if error:
-                    self._show_error(f"QR отклонён: {error}")
+                    safe_error = redact_secrets(error)
+                    logger.error(
+                        "QR protocol rejected authentication for account '%s': %s",
+                        self._aid,
+                        safe_error,
+                    )
+                    self._show_error(f"QR отклонён: {safe_error}")
                     return
 
                 remaining = max(0, int(qr_session.ttl - elapsed))
@@ -144,7 +154,11 @@ class QRScreen(ModalScreen[bool]):
             try:
                 await client.disconnect()
             except Exception as exc:
-                logger.warning("QR client disconnect failed for '%s': %s", self._aid, exc)
+                logger.warning(
+                    "QR client disconnect failed for account '%s': %s",
+                    self._aid,
+                    type(exc).__name__,
+                )
 
     async def _request_password(self, challenge: dict) -> str:
         status = self.query_one("#qr-status-label", Label)
@@ -186,7 +200,9 @@ class QRScreen(ModalScreen[bool]):
             password_input.display = False
 
     def _show_error(self, message: str) -> None:
-        safe_message = escape(message.strip() or "Неизвестная ошибка")
+        safe_message = escape(
+            redact_secrets(message.strip() or "Неизвестная ошибка")
+        )
         log = self.query_one("#qr-log", RichLog)
         log.write(f"\n[red]❌ Ошибка авторизации: {safe_message}[/red]")
         log.display = False

@@ -1,5 +1,6 @@
 """maxBridge TUI — главный модуль приложения."""
 
+import logging
 import os
 import signal
 import subprocess
@@ -18,8 +19,11 @@ from maxbridge.auth.session import Session
 from maxbridge.config import get_nested, load_config
 from maxbridge.tui.accounts_store import load_accounts, load_active, save_active
 from maxbridge.tui.helpers import resolve_session_path, session_exists
-from maxbridge.tui.screens import ChatListScreen, SessionScreen
+from maxbridge.tui.screens import ChatListScreen, LogsScreen, SessionScreen
 from maxbridge.tui.styles import CYBERPUNK_CSS, LOGO
+from maxbridge.utils.logger import redact_secrets, setup_error_logging
+
+logger = logging.getLogger("maxbridge.tui.app")
 
 
 def _runtime_root() -> Path:
@@ -55,6 +59,19 @@ def _open_daemon_log():
     except OSError:
         os.close(descriptor)
         raise
+
+
+def _main_menu_options() -> tuple[Option, ...]:
+    return (
+        Option(
+            "🔐 Сессии        [dim]управление аккаунтами[/dim]", id="sessions"
+        ),
+        Option("💬 Чаты           [dim]каналы и диалоги[/dim]", id="chats"),
+        Option("📨 Telegram       [dim]оповещения[/dim]", id="telegram"),
+        Option("📋 Логи           [dim]ошибки демона и TUI[/dim]", id="logs"),
+        Option("", id="daemon-toggle"),
+        Option("🚪 Выход", id="quit"),
+    )
 
 
 class MaxBridgeTUI(App):
@@ -101,14 +118,7 @@ class MaxBridgeTUI(App):
         with Vertical(id="main-menu"):
             yield Static(LOGO, id="logo-box")
             yield OptionList(
-                Option("🔐 Сессии        [dim]управление аккаунтами[/dim]",
-                       id="sessions"),
-                Option("💬 Чаты           [dim]каналы и диалоги[/dim]",
-                       id="chats"),
-                Option("📨 Telegram       [dim]оповещения[/dim]",
-                       id="telegram"),
-                Option("", id="daemon-toggle"),
-                Option("🚪 Выход", id="quit"),
+                *_main_menu_options(),
                 id="menu-options",
             )
         yield Footer()
@@ -129,6 +139,7 @@ class MaxBridgeTUI(App):
             "sessions": self._open_sessions,
             "chats": self._open_chats,
             "telegram": self._open_telegram,
+            "logs": self._open_logs,
             "daemon-toggle": self._toggle_daemon,
             "quit": self.exit,
         }
@@ -154,6 +165,9 @@ class MaxBridgeTUI(App):
         from maxbridge.tui.screens.telegram import TelegramScreen
         self.push_screen(TelegramScreen())
 
+    def _open_logs(self) -> None:
+        self.push_screen(LogsScreen(self._config, _runtime_root()))
+
     def _open_chats(self) -> None:
         aid, sess = self._require_session()
         if aid and sess:
@@ -167,12 +181,22 @@ class MaxBridgeTUI(App):
                 self.notify(f"🛑 Останавливаем демон (PID {pid})...")
             except ProcessLookupError:
                 pass
+            except OSError as exc:
+                logger.exception("Unable to stop the maxBridge daemon")
+                self.notify(
+                    f"❌ Не удалось остановить демон: {redact_secrets(exc)}",
+                    severity="error",
+                )
+                return
         else:
             try:
                 daemon_log = _open_daemon_log()
             except OSError as exc:
+                logger.exception("Unable to open the TUI daemon output log")
                 self.notify(
-                    f"❌ Не удалось открыть лог демона: {exc}", severity="error"
+                    "❌ Не удалось открыть лог демона: "
+                    f"{redact_secrets(exc)}",
+                    severity="error",
                 )
                 return
             try:
@@ -189,6 +213,13 @@ class MaxBridgeTUI(App):
                     stderr=daemon_log,
                     start_new_session=True,
                 )
+            except OSError as exc:
+                logger.exception("Unable to start the maxBridge daemon")
+                self.notify(
+                    f"❌ Не удалось запустить демон: {redact_secrets(exc)}",
+                    severity="error",
+                )
+                return
             finally:
                 daemon_log.close()
             self.notify("🚀 Запуск демона...")
@@ -231,7 +262,7 @@ class MaxBridgeTUI(App):
                 label = f"🔴 Остановить демон  [dim]PID {pid}[/dim]"
             else:
                 label = "🟢 Запустить демон"
-            ol.replace_option_prompt_at_index(3, label)
+            ol.replace_option_prompt("daemon-toggle", label)
         except Exception:
             pass
 
@@ -263,9 +294,18 @@ class MaxBridgeTUI(App):
 
 
 def tui_entry() -> None:
-    os.chdir(_runtime_root())
-    app = MaxBridgeTUI()
-    app.run()
+    runtime_root = _runtime_root()
+    os.chdir(runtime_root)
+    try:
+        setup_error_logging(runtime_root)
+    except OSError:
+        logger.exception("Canonical TUI error log is unavailable")
+    try:
+        app = MaxBridgeTUI()
+        app.run()
+    except Exception:
+        logger.exception("maxBridge TUI startup or runtime failed")
+        raise
 
 
 if __name__ == "__main__":

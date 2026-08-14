@@ -1,5 +1,6 @@
 """Экраны управления сессиями."""
 
+import logging
 from pathlib import Path
 
 from textual import on, work
@@ -23,6 +24,9 @@ from maxbridge.tui.helpers import (
 )
 from maxbridge.tui.screens.qr import QRScreen
 from maxbridge.tui.styles import CYBERPUNK_CSS
+from maxbridge.utils.logger import redact_secrets
+
+logger = logging.getLogger("maxbridge.tui.sessions")
 
 
 class SessionDetailScreen(Screen):
@@ -107,8 +111,12 @@ class SessionDetailScreen(Screen):
                 f"  Обновлён  {format_ts(update_time)}"
             )
         except Exception as e:
+            logger.exception("Failed to load profile for account '%s'", self._aid)
             log.clear()
-            log.write(f"[red]  ❌ Ошибка загрузки профиля: {e}[/red]")
+            log.write(
+                "[red]  ❌ Ошибка загрузки профиля: "
+                f"{redact_secrets(e)}[/red]"
+            )
         finally:
             if client:
                 await client.disconnect()

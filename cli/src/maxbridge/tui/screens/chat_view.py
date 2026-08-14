@@ -1,6 +1,7 @@
 """Экран чата — история + live сообщения + отправка."""
 
 import asyncio
+import logging
 import time as _time
 
 from textual import on, work
@@ -17,8 +18,10 @@ from maxbridge.protocol.max_client import MaxClient
 from maxbridge.tui.helpers import connect_and_login
 from maxbridge.tui.styles import CYBERPUNK_CSS
 from maxbridge.utils.constants import Opcode
+from maxbridge.utils.logger import redact_secrets
 
 HISTORY_COUNT = 30
+logger = logging.getLogger("maxbridge.tui.chat_view")
 
 
 class ConfirmLeaveScreen(ModalScreen[bool]):
@@ -121,6 +124,9 @@ class ChatViewScreen(Screen):
                 f"✅ Вы отписались от «{self._chat_name or self._chat_id}»")
             self._set_unsubscribed()
         except Exception as e:
+            logger.exception(
+                "Failed to leave MAX chat for account '%s'", self._aid
+            )
             self._write_error(f"❌ Ошибка отписки: {e}")
 
     @work(thread=False)
@@ -136,6 +142,9 @@ class ChatViewScreen(Screen):
                 f"✅ Вы подписались на «{self._chat_name or self._chat_id}»")
             self._set_subscribed()
         except Exception as e:
+            logger.exception(
+                "Failed to rejoin MAX chat for account '%s'", self._aid
+            )
             self._write_error(f"❌ Ошибка подписки: {e}")
 
     def _set_unsubscribed(self) -> None:
@@ -192,14 +201,24 @@ class ChatViewScreen(Screen):
                 opcode=Opcode.SEND_MESSAGE, payload=payload, timeout=10)
             rp = resp.get("payload") or {}
             if rp.get("error"):
-                self._write_error(
+                safe_error = redact_secrets(
                     rp.get("localizedMessage")
                     or rp.get("message")
-                    or str(rp["error"]))
+                    or str(rp["error"])
+                )
+                logger.error(
+                    "MAX send response error for account '%s': %s",
+                    self._aid,
+                    safe_error,
+                )
+                self._write_error(safe_error)
             else:
                 self._write_msg(
                     {"sender": self._my_id, "text": text, "attaches": []})
         except Exception as e:
+            logger.exception(
+                "Failed to send a MAX message for account '%s'", self._aid
+            )
             self._write_error(f"❌ Не отправлено: {e}")
 
     async def _reconnect(self) -> None:
@@ -251,7 +270,7 @@ class ChatViewScreen(Screen):
     def _write_error(self, text: str) -> None:
         try:
             log = self.query_one("#chat-log", RichLog)
-            log.write(f"[bold red]  ✖ {text}[/bold red]")
+            log.write(f"[bold red]  ✖ {redact_secrets(text)}[/bold red]")
             log.scroll_end(animate=False)
         except Exception:
             pass
@@ -321,5 +340,11 @@ class ChatViewScreen(Screen):
             log.scroll_end(animate=False)
             self._attach_live_listener()
         except Exception as e:
-            log.write(f"[bold red]  ❌ Ошибка подключения: {e}[/bold red]")
+            logger.exception(
+                "Failed to open MAX chat for account '%s'", self._aid
+            )
+            log.write(
+                "[bold red]  ❌ Ошибка подключения: "
+                f"{redact_secrets(e)}[/bold red]"
+            )
             log.write("[dim]  Нажмите ESC и откройте чат заново[/dim]")

@@ -43,6 +43,8 @@ Footer > .footer--key { background: #2a1a4e; color: #ff00ff; }
 .hint { color: #555577; margin-top: 1; }
 
 #chat-log { height: 1fr; border: solid #00ffcc; background: #0a0a12; }
+#error-log { height: 1fr; border: solid #00ffcc; background: #0a0a12; padding: 0 1; }
+#logs-status { height: auto; color: #8888aa; margin-bottom: 1; }
 #chat-input { background: #0d0d1a; border: solid #333355; color: #00ffcc; }
 #chat-header-label {
     background: #1a0a2e; color: #ff00ff; text-style: bold; padding: 0 2; height: 1;

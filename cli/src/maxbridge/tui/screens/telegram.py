@@ -1,5 +1,7 @@
 """Экран настроек Telegram оповещений."""
 
+import logging
+
 import aiohttp
 from textual import on, work
 from textual.app import ComposeResult
@@ -14,11 +16,14 @@ from maxbridge.telegram.config import (
     save_telegram_config,
 )
 from maxbridge.tui.styles import CYBERPUNK_CSS
+from maxbridge.utils.logger import redact_secrets
 
 _DIRECT_TEST_LABEL = "🧪 Тест Bot API"
 _DIRECT_TEST_SCOPE = (
     "[dim]Только прямая проверка Bot API; готовность форвардинга демона не проверяется.[/dim]"
 )
+logger = logging.getLogger("maxbridge.tui.telegram")
+_ERROR_BODY_LIMIT = 500
 
 
 class TelegramScreen(Screen):
@@ -77,20 +82,33 @@ class TelegramScreen(Screen):
 
     def _toggle(self) -> None:
         self._config.enabled = not self._config.enabled
-        self._save()
+        if not self._save():
+            self._config.enabled = not self._config.enabled
+            return
         ol = self.query_one("#tg-actions", OptionList)
         ol.replace_option_prompt_at_index(0, self._toggle_label())
         state = "включены" if self._config.enabled else "выключены"
         self._log(f"Оповещения {state}")
 
-    def _save(self) -> None:
+    def _save(self) -> bool:
         self._config.bot_token = self.query_one(
             "#tg-token", Input).value.strip()
         self._config.chat_id = self.query_one(
             "#tg-chat-id", Input).value.strip()
-        save_telegram_config(self._config)
+        try:
+            save_telegram_config(self._config)
+        except Exception as exc:
+            logger.exception("Failed to save Telegram settings")
+            error_type = type(exc).__name__
+            self._log(f"[red]❌ Не удалось сохранить настройки ({error_type})[/red]")
+            self.notify(
+                f"❌ Не удалось сохранить настройки ({error_type})",
+                severity="error",
+            )
+            return False
         self._log("💾 Настройки сохранены")
         self.notify("💾 Сохранено", severity="information")
+        return True
 
     @work(thread=False)
     async def _test(self) -> None:
@@ -119,14 +137,24 @@ class TelegramScreen(Screen):
                         )
                     else:
                         body = await resp.text()
-                        self._log(f"[red]❌ Ошибка {resp.status}: "
-                                  f"{body[:100]}[/red]")
+                        safe_body = redact_secrets(
+                            body[:_ERROR_BODY_LIMIT]
+                        )[:_ERROR_BODY_LIMIT]
+                        logger.error(
+                            "Telegram Bot API returned HTTP %s: %s",
+                            resp.status,
+                            safe_body,
+                        )
+                        self._log(
+                            f"[red]❌ Ошибка {resp.status}: {safe_body}[/red]"
+                        )
         except Exception as exc:
+            logger.exception("Telegram Bot API connectivity test failed")
             self._log(f"[red]❌ Ошибка Bot API: {type(exc).__name__}[/red]")
 
     def _log(self, text: str) -> None:
         try:
-            self.query_one("#tg-log", RichLog).write(text)
+            self.query_one("#tg-log", RichLog).write(redact_secrets(text))
         except Exception:
             pass
 

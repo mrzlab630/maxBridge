@@ -25,7 +25,7 @@ from maxbridge.telegram.config import load_telegram_config_snapshot, telegram_co
 from maxbridge.telegram.control_bot import TelegramControlBot
 from maxbridge.telegram.forwarder import TelegramForwarder
 from maxbridge.utils.constants import Opcode
-from maxbridge.utils.logger import setup_logging
+from maxbridge.utils.logger import redact_secrets, setup_error_logging, setup_logging
 
 logger = logging.getLogger("maxbridge.main")
 
@@ -374,7 +374,8 @@ def cli_entry() -> None:
         return
 
     config = load_config(args.config)
-    os.chdir(getattr(config, "runtime_root", Path.cwd()))
+    runtime_root = Path(getattr(config, "runtime_root", Path.cwd()))
+    os.chdir(runtime_root)
 
     # --debug overrides config logging level
     log_level = "DEBUG" if args.debug else get_nested(config, "logging.level", "WARNING")
@@ -384,6 +385,10 @@ def cli_entry() -> None:
         fmt=get_nested(config, "logging.format",
                        "%(asctime)s [%(levelname)s] %(name)s: %(message)s"),
     )
+    try:
+        setup_error_logging(runtime_root)
+    except OSError:
+        logger.exception("Canonical daemon error log is unavailable")
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     daemon: MaxBridgeDaemon | None = None
@@ -416,13 +421,13 @@ def cli_entry() -> None:
         pass
     except (MaxApiError, MaxConnectionError) as e:
         logger.exception("MAX connection/auth error")
-        print(f"\n[ERROR] {e}")
+        print(f"\n[ERROR] {redact_secrets(e)}")
     except RuntimeError as e:
         logger.exception("Runtime error in maxBridge")
-        print(f"\n[ERROR] {e}")
+        print(f"\n[ERROR] {redact_secrets(e)}")
     except Exception as e:
         logger.exception("Unhandled maxBridge error")
-        print(f"\n[ERROR] {e}")
+        print(f"\n[ERROR] {redact_secrets(e)}")
     finally:
         try:
             if normal_daemon_entered:

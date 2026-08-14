@@ -1,6 +1,7 @@
 """Экран списка чатов — каналы и диалоги."""
 
 import asyncio
+import logging
 
 from textual import on, work
 from textual.app import ComposeResult
@@ -16,8 +17,10 @@ from maxbridge.tui.helpers import connect_and_login
 from maxbridge.tui.screens.chat_view import ChatViewScreen
 from maxbridge.tui.styles import CYBERPUNK_CSS
 from maxbridge.utils.constants import Opcode
+from maxbridge.utils.logger import redact_secrets
 
 TEXT_PREVIEW_LEN = 40
+logger = logging.getLogger("maxbridge.tui.chat_list")
 
 
 class ChatListScreen(Screen):
@@ -131,7 +134,8 @@ class ChatListScreen(Screen):
                 self._chat_ids.clear()
                 self._load_chats()
         except Exception as e:
-            self.notify(f"❌ {e}", severity="error")
+            logger.exception("Failed to join a MAX chat for account '%s'", self._aid)
+            self.notify(f"❌ {redact_secrets(e)}", severity="error")
 
     def _disconnect(self) -> None:
         if self._client:
@@ -223,5 +227,8 @@ class ChatListScreen(Screen):
             if self._client:
                 self._client.set_packet_callback(on_msg)
         except Exception as e:
+            logger.exception("Failed to load MAX chats for account '%s'", self._aid)
             ol.clear_options()
-            ol.add_option(Option(f"[red]❌ Ошибка: {e}[/red]"))
+            ol.add_option(
+                Option(f"[red]❌ Ошибка: {redact_secrets(e)}[/red]")
+            )
