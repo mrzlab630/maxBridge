@@ -16,6 +16,7 @@ from maxbridge.main import (
 from maxbridge.telegram import forwarder as forwarder_module
 from maxbridge.telegram.config import TelegramConfig, save_telegram_config
 from maxbridge.telegram.forwarder import TelegramForwarder
+from maxbridge.utils.constants import Opcode
 from maxbridge.utils.types import MessageStatus, UnifiedMessage
 
 
@@ -27,9 +28,9 @@ class _FakeClientSession:
         self.closed = True
 
 
-def _message() -> UnifiedMessage:
+def _message(account_id: str = "default") -> UnifiedMessage:
     return UnifiedMessage(
-        account_id="default",
+        account_id=account_id,
         chat_id=123,
         message_id="m1",
         status=MessageStatus.NEW,
@@ -197,3 +198,60 @@ def test_register_accounts_loads_dynamic_store_with_config_priority(tmp_path):
         (("default", {"session_file": "data/default.session"}),),
         (("account_2", {"session_file": "data/account_2.session"}),),
     ]
+
+
+@pytest.mark.asyncio
+async def test_account_scoped_packet_publishes_only_its_own_event(monkeypatch):
+    daemon = MaxBridgeDaemon.__new__(MaxBridgeDaemon)
+    daemon._event_bus = EventBus()
+    daemon._entity_cache = MagicMock()
+    daemon._stats = MagicMock()
+    daemon._routers = {}
+    manager = MagicMock()
+    manager.account_ids = ["default", "account_2"]
+    accounts = {
+        "default": MagicMock(),
+        "account_2": MagicMock(),
+    }
+    manager.require.side_effect = accounts.__getitem__
+    callbacks = {}
+    manager.set_packet_callback.side_effect = callbacks.__setitem__
+    daemon._manager = manager
+    received = []
+
+    async def receive(message):
+        received.append(message)
+
+    daemon._event_bus.subscribe("test", receive)
+
+    def message_handler_factory(_bus, *, account_id, **_kwargs):
+        async def handler(_client, _packet):
+            await daemon._event_bus.publish(_message(account_id))
+
+        return handler
+
+    def attachment_handler_factory(*_args, **_kwargs):
+        async def handler(_client, _packet):
+            return None
+
+        return handler
+
+    monkeypatch.setattr(
+        main_module,
+        "create_message_handler",
+        message_handler_factory,
+    )
+    monkeypatch.setattr(
+        main_module,
+        "create_upload_complete_handler",
+        attachment_handler_factory,
+    )
+
+    daemon._configure_account_routes("all")
+    await callbacks["account_2"](
+        MagicMock(),
+        {"opcode": Opcode.INCOMING_MESSAGE, "payload": {}},
+    )
+
+    assert [message.account_id for message in received] == ["account_2"]
+    assert set(callbacks) == {"default", "account_2"}

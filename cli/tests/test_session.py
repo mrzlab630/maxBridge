@@ -1,6 +1,8 @@
 """Tests for encrypted session storage."""
 
+import json
 import os
+from pathlib import Path
 
 from maxbridge.auth.session import Session
 
@@ -26,6 +28,49 @@ class TestSession:
         assert s2.load()
         assert s2.device_id == "dev123"
         assert s2.token == "tok456"
+        assert s2.max_contact_id is None
+
+    def test_loads_legacy_payload_without_identity(self, tmp_dir, encryptor):
+        path = Path(tmp_dir) / "legacy.session"
+        legacy = json.dumps({"device_id": "legacy-device", "token": "legacy-token"})
+        path.write_text(encryptor.encrypt(legacy), encoding="utf-8")
+
+        session = Session(str(path), encryptor)
+
+        assert session.load() is True
+        assert session.device_id == "legacy-device"
+        assert session.token == "legacy-token"
+        assert session.max_contact_id is None
+
+    def test_identity_is_persisted_only_inside_encrypted_payload(self, tmp_dir, encryptor):
+        path = Path(tmp_dir) / "identity.session"
+        session = Session(str(path), encryptor)
+        session.save("device", "token", "000123")
+
+        raw = path.read_text(encoding="utf-8")
+        assert "device" not in raw
+        assert "token" not in raw
+        assert "123" not in raw
+
+        loaded = Session(str(path), encryptor)
+        assert loaded.load() is True
+        assert loaded.max_contact_id == "123"
+
+    def test_malformed_optional_identity_does_not_break_session_load(
+        self, tmp_dir, encryptor
+    ):
+        path = Path(tmp_dir) / "malformed-identity.session"
+        payload = json.dumps({
+            "device_id": "device",
+            "token": "token",
+            "max_contact_id": {"unexpected": "value"},
+        })
+        path.write_text(encryptor.encrypt(payload), encoding="utf-8")
+
+        session = Session(str(path), encryptor)
+
+        assert session.load() is True
+        assert session.max_contact_id is None
 
     def test_file_permissions(self, tmp_dir, encryptor):
         path = os.path.join(tmp_dir, "perm.session")
@@ -41,6 +86,7 @@ class TestSession:
         assert not s.exists()
         assert s.device_id is None
         assert s.token is None
+        assert s.max_contact_id is None
 
     def test_load_nonexistent(self, tmp_dir, encryptor):
         s = Session(os.path.join(tmp_dir, "nope.session"), encryptor)

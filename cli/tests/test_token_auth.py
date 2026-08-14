@@ -14,6 +14,40 @@ from maxbridge.protocol.errors import MaxApiError, MaxAuthRequiredError
 
 class TestTokenAuth:
     @pytest.mark.asyncio
+    async def test_successful_login_backfills_encrypted_identity(self, tmp_dir, encryptor):
+        path = os.path.join(tmp_dir, "legacy.session")
+        session = Session(path, encryptor)
+        session.save("dev123", "tok123")
+        client = MagicMock()
+        client.login_by_token = AsyncMock(return_value={
+            "payload": {"profile": {"contact": {"id": 987654}}},
+        })
+
+        await login_with_token(client, session)
+
+        loaded = Session(path, encryptor)
+        assert loaded.load() is True
+        assert loaded.device_id == "dev123"
+        assert loaded.token == "tok123"
+        assert loaded.max_contact_id == "987654"
+
+    @pytest.mark.asyncio
+    async def test_login_without_verified_identity_does_not_backfill(
+        self, tmp_dir, encryptor
+    ):
+        path = os.path.join(tmp_dir, "unknown-identity.session")
+        session = Session(path, encryptor)
+        session.save("dev123", "tok123")
+        before = open(path, "rb").read()
+        client = MagicMock()
+        client.login_by_token = AsyncMock(return_value={"payload": {}})
+
+        await login_with_token(client, session)
+
+        assert session.max_contact_id is None
+        assert open(path, "rb").read() == before
+
+    @pytest.mark.asyncio
     async def test_invalid_token_clears_session_and_raises_auth_required(self, tmp_dir,
                                                                          encryptor):
         path = os.path.join(tmp_dir, "expired.session")
@@ -81,3 +115,24 @@ class TestTokenAuth:
             await login_with_token(client, session)
 
         assert not session.exists()
+
+    @pytest.mark.asyncio
+    async def test_identity_migration_does_not_clear_rejected_legacy_session(
+        self, tmp_dir, encryptor
+    ):
+        path = os.path.join(tmp_dir, "preserved-rejected.session")
+        session = Session(path, encryptor)
+        session.save("dev123", "tok123")
+        before = open(path, "rb").read()
+        client = MagicMock()
+        client.login_by_token = AsyncMock(side_effect=RuntimeError("token expired"))
+
+        with pytest.raises(MaxAuthRequiredError):
+            await login_with_token(
+                client,
+                session,
+                clear_session_on_rejection=False,
+            )
+
+        assert session.exists()
+        assert open(path, "rb").read() == before

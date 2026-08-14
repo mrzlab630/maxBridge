@@ -3,6 +3,7 @@
 import logging
 from typing import Any
 
+from maxbridge.auth.identity import resolve_auth_identity
 from maxbridge.auth.session import Session
 from maxbridge.protocol.max_client import MaxClient
 
@@ -24,7 +25,13 @@ async def verify_sms_code(client: MaxClient, sms_token: str, code: int,
     response = await client.verify_sms_code(sms_token, code)
 
     login_token = client.extract_login_token(response)
-    session.save(client.device_id, login_token)
+    identity = await resolve_auth_identity(
+        client,
+        response,
+        login_token,
+        client.device_id,
+    )
+    session.save(client.device_id, login_token, identity)
 
     logger.info("SMS authentication successful")
     return response

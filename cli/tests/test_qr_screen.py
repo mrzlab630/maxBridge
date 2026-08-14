@@ -33,6 +33,8 @@ def _qr_client(challenge: dict, password_result: dict | Exception) -> MagicMock:
     if isinstance(password_result, Exception):
         client.check_password = AsyncMock(side_effect=password_result)
     else:
+        payload = password_result.setdefault("payload", {})
+        payload.setdefault("profile", {"contact": {"id": 222}})
         client.check_password = AsyncMock(return_value=password_result)
     return client
 
@@ -69,6 +71,7 @@ async def test_qr_screen_prompts_for_password_challenge(tmp_dir, encryptor):
     assert session.load() is True
     assert session.device_id == "device-2fa"
     assert session.token == "token-2fa"
+    assert session.max_contact_id == "222"
 
 
 @pytest.mark.asyncio
@@ -95,3 +98,49 @@ async def test_qr_screen_keeps_auth_error_visible(tmp_dir, encryptor):
                 status.render()
             )
             assert session.exists() is False
+
+
+@pytest.mark.asyncio
+async def test_qr_screen_rejects_duplicate_and_clears_only_new_session(
+    tmp_dir, encryptor
+):
+    session = Session(os.path.join(tmp_dir, "qr-duplicate.session"), encryptor)
+    client = MagicMock()
+    client.device_id = "new-device"
+    client.connect = AsyncMock()
+    client.disconnect = AsyncMock()
+    client.request_qr = AsyncMock(return_value={
+        "qrLink": "https://example.com/qr",
+        "trackId": "qr-track",
+        "ttl": 1000,
+        "pollingInterval": 1,
+    })
+    client.check_qr_status = AsyncMock(return_value={
+        "status": {"loginAvailable": True},
+    })
+    client.login_by_qr = AsyncMock(return_value={
+        "payload": {
+            "token": "new-token",
+            "profile": {"contact": {"id": 777}},
+        },
+    })
+    client.extract_password_challenge.return_value = None
+    client.extract_login_token.return_value = "new-token"
+    duplicate_guard = AsyncMock(return_value="default")
+    screen = QRScreen(session, "account_2", duplicate_guard=duplicate_guard)
+    app = App()
+
+    with patch("maxbridge.tui.screens.qr.MaxClient", return_value=client):
+        async with app.run_test(size=(80, 24)) as pilot:
+            await app.push_screen(screen)
+            await pilot.pause(0.05)
+
+            status = str(screen.query_one("#qr-status-label", Label).render())
+            assert app.screen is screen
+            assert "account_2" in status
+            assert "default" in status
+            assert "777" not in status
+            assert "new-token" not in status
+
+    duplicate_guard.assert_awaited_once_with("777")
+    assert session.exists() is False

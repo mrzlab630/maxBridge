@@ -3,6 +3,7 @@
 import asyncio
 import io
 import logging
+from collections.abc import Awaitable, Callable
 
 from rich.markup import escape
 from textual import on, work
@@ -12,6 +13,7 @@ from textual.containers import Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Input, Label, RichLog
 
+from maxbridge.auth.identity import DuplicateMaxIdentityError
 from maxbridge.auth.qr_auth import complete_qr_auth, request_qr_session
 from maxbridge.auth.session import Session
 from maxbridge.protocol.max_client import MaxClient
@@ -28,10 +30,16 @@ class QRScreen(ModalScreen[bool]):
     CSS = CYBERPUNK_CSS
     BINDINGS = [Binding("escape", "cancel", "Назад")]
 
-    def __init__(self, session: Session, account_id: str) -> None:
+    def __init__(
+        self,
+        session: Session,
+        account_id: str,
+        duplicate_guard: Callable[[str], Awaitable[str | None]] | None = None,
+    ) -> None:
         super().__init__()
         self._session = session
         self._aid = account_id
+        self._duplicate_guard = duplicate_guard
         self._password_future: asyncio.Future[str] | None = None
 
     def compose(self) -> ComposeResult:
@@ -123,6 +131,17 @@ class QRScreen(ModalScreen[bool]):
                         self._session,
                         password_provider=self._request_password,
                     )
+                    if self._duplicate_guard is not None:
+                        try:
+                            duplicate_of = await self._duplicate_guard(
+                                self._session.max_contact_id or ""
+                            )
+                        except Exception:
+                            self._session.clear()
+                            raise
+                        if duplicate_of is not None:
+                            self._session.clear()
+                            raise DuplicateMaxIdentityError(self._aid, duplicate_of)
                     status.update("[bold green]✅ АВТОРИЗАЦИЯ УСПЕШНА[/bold green]")
                     await asyncio.sleep(_SUCCESS_DISPLAY_SECONDS)
                     self.dismiss(True)

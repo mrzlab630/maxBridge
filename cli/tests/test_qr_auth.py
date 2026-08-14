@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from maxbridge.auth.identity import MaxIdentityUnavailableError
 from maxbridge.auth.qr_auth import QrAuthSession, complete_qr_auth, render_qr_png
 from maxbridge.auth.session import Session
 
@@ -29,7 +30,10 @@ class TestQrAuth:
         client = MagicMock()
         client.device_id = "dev123"
         client.login_by_qr = AsyncMock(return_value={
-            "payload": {"tokenAttrs": {"LOGIN": {"token": "tok123"}}},
+            "payload": {
+                "tokenAttrs": {"LOGIN": {"token": "tok123"}},
+                "profile": {"contact": {"id": 123}},
+            },
         })
         client.extract_password_challenge.return_value = None
         client.extract_login_token.return_value = "tok123"
@@ -41,7 +45,9 @@ class TestQrAuth:
         assert session.exists()
         assert session.device_id == "dev123"
         assert session.token == "tok123"
+        assert session.max_contact_id == "123"
         client.check_password.assert_not_called()
+        client.login_by_token.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_complete_qr_auth_handles_password_challenge(self, tmp_dir, encryptor):
@@ -61,7 +67,10 @@ class TestQrAuth:
         })
         client.extract_password_challenge.return_value = challenge
         client.check_password = AsyncMock(return_value={
-            "payload": {"tokenAttrs": {"LOGIN": {"token": "tok456"}}},
+            "payload": {
+                "tokenAttrs": {"LOGIN": {"token": "tok456"}},
+                "profile": {"contact": {"id": "456"}},
+            },
         })
         client.extract_login_token.return_value = "tok456"
         password_provider = AsyncMock(return_value="super-secret")
@@ -79,3 +88,40 @@ class TestQrAuth:
         assert session.exists()
         assert session.device_id == "dev456"
         assert session.token == "tok456"
+        assert session.max_contact_id == "456"
+
+    @pytest.mark.asyncio
+    async def test_missing_qr_profile_is_resolved_by_token_login(self, tmp_dir, encryptor):
+        session = Session(os.path.join(tmp_dir, "qr-fallback.session"), encryptor)
+        qr_session = QrAuthSession("https://example.com/qr", "track-3", 120, 5)
+        client = MagicMock()
+        client.device_id = "dev789"
+        client.login_by_qr = AsyncMock(return_value={
+            "payload": {"tokenAttrs": {"LOGIN": {"token": "tok789"}}},
+        })
+        client.extract_password_challenge.return_value = None
+        client.extract_login_token.return_value = "tok789"
+        client.login_by_token = AsyncMock(return_value={
+            "payload": {"profile": {"contact": {"id": 789}}},
+        })
+
+        await complete_qr_auth(client, qr_session, session)
+
+        client.login_by_token.assert_awaited_once_with("tok789", "dev789")
+        assert session.max_contact_id == "789"
+
+    @pytest.mark.asyncio
+    async def test_unknown_qr_identity_is_not_saved(self, tmp_dir, encryptor):
+        session = Session(os.path.join(tmp_dir, "qr-unknown.session"), encryptor)
+        qr_session = QrAuthSession("https://example.com/qr", "track-4", 120, 5)
+        client = MagicMock()
+        client.device_id = "dev000"
+        client.login_by_qr = AsyncMock(return_value={"payload": {"token": "tok000"}})
+        client.extract_password_challenge.return_value = None
+        client.extract_login_token.return_value = "tok000"
+        client.login_by_token = AsyncMock(return_value={"payload": {}})
+
+        with pytest.raises(MaxIdentityUnavailableError):
+            await complete_qr_auth(client, qr_session, session)
+
+        assert session.exists() is False

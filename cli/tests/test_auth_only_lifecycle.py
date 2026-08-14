@@ -117,7 +117,12 @@ async def test_terminal_password_challenge_uses_getpass_without_disclosure(
     client.device_id = "test-device"
     client.login_by_qr = AsyncMock(return_value={"payload": {"passwordChallenge": challenge}})
     client.extract_password_challenge.return_value = challenge
-    client.check_password = AsyncMock(return_value={"payload": {"token": "test-login-token"}})
+    client.check_password = AsyncMock(return_value={
+        "payload": {
+            "token": "test-login-token",
+            "profile": {"contact": {"id": 123}},
+        },
+    })
     client.extract_login_token.return_value = "test-login-token"
     session = MagicMock()
     monkeypatch.setattr(qr_auth_module.getpass, "getpass", lambda _prompt: password)
@@ -131,3 +136,29 @@ async def test_terminal_password_challenge_uses_getpass_without_disclosure(
     client.check_password.assert_awaited_once_with("test-track", password)
     combined = capsys.readouterr().out + capsys.readouterr().err + caplog.text
     assert password not in combined
+
+
+@pytest.mark.asyncio
+async def test_terminal_duplicate_auth_is_failure_and_clears_new_session():
+    authenticator = main_module.TerminalAuthenticator.__new__(
+        main_module.TerminalAuthenticator
+    )
+    manager = MagicMock()
+    account = MagicMock()
+    account.has_session.return_value = False
+    account.authenticate_qr = AsyncMock()
+    account.session.max_contact_id = "555"
+    account.session.clear = MagicMock()
+    manager.require.return_value = account
+    manager.account_ids = ["account_2"]
+    manager.find_duplicate_account = AsyncMock(return_value="default")
+    authenticator._manager = manager
+
+    with pytest.raises(RuntimeError, match="account_2.*default"):
+        await authenticator.authenticate("account_2")
+
+    account.session.clear.assert_called_once_with()
+    manager.find_duplicate_account.assert_awaited_once_with(
+        "555",
+        exclude_account_id="account_2",
+    )

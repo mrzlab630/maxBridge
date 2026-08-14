@@ -13,6 +13,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
+from maxbridge.auth.identity import resolve_auth_identity
 from maxbridge.auth.session import Session
 from maxbridge.protocol.max_client import MaxClient
 
@@ -127,7 +128,13 @@ async def complete_qr_auth(client: MaxClient, qr_session: QrAuthSession,
         auth_response = await client.check_password(track_id, password)
 
     login_token = client.extract_login_token(auth_response)
-    session.save(client.device_id, login_token)
+    identity = await resolve_auth_identity(
+        client,
+        auth_response,
+        login_token,
+        client.device_id,
+    )
+    session.save(client.device_id, login_token, identity)
     logger.info("QR authentication successful")
     return auth_response
 

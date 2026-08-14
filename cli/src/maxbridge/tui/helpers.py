@@ -5,6 +5,7 @@ from pathlib import Path
 
 from maxbridge.auth.encryption import TokenEncryptor
 from maxbridge.auth.session import Session
+from maxbridge.auth.token_auth import login_with_token
 from maxbridge.protocol.max_client import MaxClient
 
 _MSK = timezone(timedelta(hours=3))
@@ -65,5 +66,5 @@ async def connect_and_login(
     """
     client = MaxClient()
     await client.connect()
-    resp = await client.login_by_token(session.token, session.device_id)
+    resp = await login_with_token(client, session)
     return client, resp

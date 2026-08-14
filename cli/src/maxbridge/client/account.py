@@ -7,6 +7,7 @@ from maxbridge.auth.encryption import TokenEncryptor
 from maxbridge.auth.qr_auth import authenticate_qr
 from maxbridge.auth.session import Session
 from maxbridge.auth.sms_auth import request_sms_code, verify_sms_code
+from maxbridge.auth.token_auth import login_with_token
 from maxbridge.client.connection import MaxConnection
 from maxbridge.utils.types import PacketHandler
 
@@ -57,6 +58,24 @@ class Account:
     async def disconnect(self) -> None:
         await self._connection.disconnect()
         logger.info("Account '%s' disconnected", self.account_id)
+
+    async def verify_identity(self) -> str | None:
+        """Return stored identity or backfill it through bounded token login."""
+        if self._session.max_contact_id is not None:
+            return self._session.max_contact_id
+        if not self._session.device_id or not self._session.token:
+            return None
+
+        client = await self._connection.create_raw_client()
+        try:
+            await login_with_token(
+                client,
+                self._session,
+                clear_session_on_rejection=False,
+            )
+            return self._session.max_contact_id
+        finally:
+            await self._connection.release_raw_client()
 
     async def authenticate_qr(self) -> None:
         """QR code auth — user scans with MAX mobile app."""

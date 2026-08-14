@@ -10,6 +10,10 @@ from pathlib import Path
 
 from maxbridge import __version__
 from maxbridge.auth.encryption import TokenEncryptor
+from maxbridge.auth.identity import (
+    DuplicateMaxIdentityError,
+    MaxIdentityUnavailableError,
+)
 from maxbridge.bridge.event_bus import EventBus
 from maxbridge.cache.entity_cache import EntityCache
 from maxbridge.client.account_manager import AccountManager
@@ -85,11 +89,26 @@ class TerminalAuthenticator:
 
             print(f"\n[{aid}] Authenticating via QR code...")
             print(f"[{aid}] Open MAX on your phone and scan the QR code.\n")
+            session_created = False
             try:
                 await account.authenticate_qr()
+                session_created = True
+                identity = account.session.max_contact_id
+                if identity is None:
+                    raise MaxIdentityUnavailableError(
+                        "MAX не вернул проверенный идентификатор профиля"
+                    )
+                duplicate_of = await self._manager.find_duplicate_account(
+                    identity,
+                    exclude_account_id=aid,
+                )
+                if duplicate_of is not None:
+                    raise DuplicateMaxIdentityError(aid, duplicate_of)
             except (MaxApiError, MaxConnectionError):
                 raise
             except Exception as exc:
+                if session_created:
+                    account.session.clear()
                 raise RuntimeError(f"[{aid}] QR auth failed: {exc}") from exc
             logger.info("Account '%s' authenticated successfully", aid)
 
@@ -126,7 +145,7 @@ class MaxBridgeDaemon:
             ttl=get_nested(config, "bridge.cache_ttl", 600),
         )
         self._event_bus = EventBus()
-        self._router = EventRouter()
+        self._routers: dict[str, EventRouter] = {}
         self._stats = StatsCollector()
         self._rpc_methods = RpcMethods(self._manager, self._event_bus, self._stats)
         self._ipc_server = IpcServer(
@@ -159,8 +178,19 @@ class MaxBridgeDaemon:
         self._start_telegram_config_watch()
 
         listen_chats = get_nested(self._config, "bridge.listen_chats", "all")
+        self._configure_account_routes(listen_chats)
+        await self._manager.connect_all()
+        await self._ipc_server.start()
+
+        logger.info("maxBridge is running. Waiting for messages...")
+        await self._shutdown_event.wait()
+
+    def _configure_account_routes(self, listen_chats: object) -> None:
+        """Build one isolated opcode router for each registered account."""
+        self._routers = {}
         for account_id in self._manager.account_ids:
             account = self._manager.require(account_id)
+            router = EventRouter()
             handler = create_message_handler(
                 self._event_bus,
                 connection=account.connection,
@@ -177,15 +207,10 @@ class MaxBridgeDaemon:
                 stats=self._stats,
                 entity_cache=self._entity_cache,
             )
-            self._router.on_opcode(Opcode.INCOMING_MESSAGE, handler)
-            self._router.on_opcode(Opcode.UPLOAD_COMPLETE, attachment_handler)
-
-        self._manager.set_packet_callback(self._router.dispatch)
-        await self._manager.connect_all()
-        await self._ipc_server.start()
-
-        logger.info("maxBridge is running. Waiting for messages...")
-        await self._shutdown_event.wait()
+            router.on_opcode(Opcode.INCOMING_MESSAGE, handler)
+            router.on_opcode(Opcode.UPLOAD_COMPLETE, attachment_handler)
+            self._routers[account_id] = router
+            self._manager.set_packet_callback(account_id, router.dispatch)
 
     async def stop(self) -> None:
         logger.info("Shutting down maxBridge...")

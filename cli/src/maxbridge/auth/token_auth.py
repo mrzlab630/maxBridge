@@ -3,6 +3,7 @@
 import logging
 from typing import Any
 
+from maxbridge.auth.identity import extract_max_contact_id
 from maxbridge.auth.session import Session
 from maxbridge.protocol.errors import MaxApiError, MaxAuthRequiredError
 from maxbridge.protocol.max_client import MaxClient
@@ -10,7 +11,12 @@ from maxbridge.protocol.max_client import MaxClient
 logger = logging.getLogger("maxbridge.auth.token")
 
 
-async def login_with_token(client: MaxClient, session: Session) -> dict[str, Any]:
+async def login_with_token(
+    client: MaxClient,
+    session: Session,
+    *,
+    clear_session_on_rejection: bool = True,
+) -> dict[str, Any]:
     """Authenticate using a previously saved session token.
 
     Only clears session on explicit auth rejection, NOT on transient errors.
@@ -22,12 +28,18 @@ async def login_with_token(client: MaxClient, session: Session) -> dict[str, Any
     logger.info("Logging in with saved token...")
     try:
         result = await client.login_by_token(session.token, session.device_id)
+        identity = extract_max_contact_id(result)
+        if identity is not None and identity != session.max_contact_id:
+            session.save(session.device_id, session.token, identity)
         logger.info("Token authentication successful")
         return result
     except Exception as e:
         if _is_auth_rejection(e):
-            logger.warning("Token rejected — clearing session")
-            session.clear()
+            if clear_session_on_rejection:
+                logger.warning("Token rejected — clearing session")
+                session.clear()
+            else:
+                logger.warning("Token rejected during identity verification")
             raise MaxAuthRequiredError(
                 "Token login failed — re-authenticate with QR",
             ) from e

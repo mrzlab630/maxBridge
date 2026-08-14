@@ -14,6 +14,7 @@ from textual.widgets.option_list import Option
 from maxbridge.auth.encryption import TokenEncryptor
 from maxbridge.auth.session import Session
 from maxbridge.cache.entity_cache import _extract_user_name
+from maxbridge.client.account_manager import AccountManager
 from maxbridge.tui.accounts_store import add_account, remove_account
 from maxbridge.tui.helpers import (
     connect_and_login,
@@ -329,14 +330,47 @@ class SessionScreen(Screen):
         session = Session(sess_path, self._encryptor)
 
         def on_qr(ok: bool) -> None:
-            if ok:
-                add_account(self._accounts_cfg, self._config_accounts,
-                            tmp_aid, cfg)
-                self._load_profile(tmp_aid, cfg)
-            else:
-                if not session.exists():
-                    self._accounts_cfg.pop(tmp_aid, None)
-            self._refresh()
+            self._finish_new_auth(tmp_aid, cfg, session, ok)
 
         self._accounts_cfg[tmp_aid] = cfg
-        self.app.push_screen(QRScreen(session, tmp_aid), on_qr)
+        self.app.push_screen(
+            QRScreen(
+                session,
+                tmp_aid,
+                duplicate_guard=lambda identity: self._find_duplicate_account(
+                    identity,
+                    tmp_aid,
+                ),
+            ),
+            on_qr,
+        )
+
+    async def _find_duplicate_account(
+        self,
+        max_contact_id: str,
+        exclude_account_id: str,
+    ) -> str | None:
+        manager = AccountManager(self._encryptor)
+        for account_id, config in self._accounts_cfg.items():
+            if account_id != exclude_account_id:
+                manager.add_account(account_id, config)
+        return await manager.find_duplicate_account(max_contact_id)
+
+    def _finish_new_auth(
+        self,
+        account_id: str,
+        config: dict,
+        session: Session,
+        ok: bool,
+    ) -> None:
+        if ok:
+            add_account(
+                self._accounts_cfg,
+                self._config_accounts,
+                account_id,
+                config,
+            )
+            self._load_profile(account_id, config)
+        elif not session.exists():
+            self._accounts_cfg.pop(account_id, None)
+        self._refresh()
