@@ -3,7 +3,8 @@
 import asyncio
 import contextlib
 import logging
-from typing import Any, Callable
+from collections.abc import Awaitable
+from typing import Any, Callable, Literal
 
 from maxbridge.auth.session import Session
 from maxbridge.auth.token_auth import login_with_token
@@ -13,6 +14,8 @@ from maxbridge.utils.constants import Opcode
 from maxbridge.utils.types import PacketHandler
 
 logger = logging.getLogger("maxbridge.client.connection")
+
+ReconnectDisposition = Literal["approved", "pending", "rejected"]
 
 
 class MaxConnection:
@@ -28,9 +31,13 @@ class MaxConnection:
         self._connected = False
         self._on_fatal_callback: Callable[[], None] | None = None
         self._on_auth_required_callback: Callable[[Exception], None] | None = None
+        self._on_reconnect_authenticated_callback: (
+            Callable[[], Awaitable[ReconnectDisposition]] | None
+        ) = None
         self._reconnecting = False
         self._reconnect_task: asyncio.Task | None = None
         self._shutdown_requested = False
+        self._producer_enabled = False
 
     @property
     def client(self) -> MaxClient:
@@ -48,6 +55,13 @@ class MaxConnection:
     def set_on_auth_required(self, callback: Callable[[Exception], None]) -> None:
         self._on_auth_required_callback = callback
 
+    def set_on_reconnect_authenticated(
+        self,
+        callback: Callable[[], Awaitable[ReconnectDisposition]],
+    ) -> None:
+        """Set manager approval hook for each successful reconnect login."""
+        self._on_reconnect_authenticated_callback = callback
+
     async def create_raw_client(self) -> MaxClient:
         """Create and connect a raw MaxClient (for initial SMS auth)."""
         client = MaxClient()
@@ -64,6 +78,7 @@ class MaxConnection:
     async def connect(self) -> MaxClient:
         """Create client, connect, authenticate with saved token."""
         self._shutdown_requested = False
+        self._producer_enabled = False
         self._client = MaxClient()
         try:
             await self._client.connect()
@@ -78,19 +93,28 @@ class MaxConnection:
         self._connected = True
 
         self._client.set_reconnect_callback(self._request_reconnect)
-        if self._packet_callback:
-            self._client.set_packet_callback(self._packet_callback)
+        if self._on_reconnect_authenticated_callback is None:
+            self.set_producer_enabled(True)
 
         logger.info("Connected and authenticated to MAX")
         return self._client
 
     def set_packet_callback(self, callback: PacketHandler) -> None:
         self._packet_callback = callback
-        if self._client:
+        if self._client and self._producer_enabled:
             self._client.set_packet_callback(callback)
+
+    def set_producer_enabled(self, enabled: bool) -> None:
+        """Gate packet delivery until manager identity arbitration approves it."""
+        if self._producer_enabled == enabled:
+            return
+        self._producer_enabled = enabled
+        if enabled and self._client and self._packet_callback:
+            self._client.set_packet_callback(self._packet_callback)
 
     async def disconnect(self) -> None:
         self._shutdown_requested = True
+        self._producer_enabled = False
         reconnect_task = self._reconnect_task
         self._reconnect_task = None
         if reconnect_task and not reconnect_task.done():
@@ -106,6 +130,7 @@ class MaxConnection:
             self._client = None
             logger.info("Disconnected from MAX")
         self._connected = False
+        self._producer_enabled = False
         self._reconnecting = False
 
     async def _cleanup_failed_client(self) -> None:
@@ -194,6 +219,7 @@ class MaxConnection:
             return
         self._reconnecting = True
         self._connected = False
+        self._producer_enabled = False
 
         if self._client:
             try:
@@ -224,13 +250,29 @@ class MaxConnection:
                         await client.disconnect()
                         return
 
+                    disposition = await self._reconnect_disposition()
+                    if self._shutdown_requested:
+                        await client.disconnect()
+                        return
+                    if disposition == "rejected":
+                        await client.disconnect()
+                        logger.warning("Reconnected session rejected by account manager")
+                        return
+
                     self._client = client
                     self._connected = True
                     client.set_reconnect_callback(self._request_reconnect)
-                    if self._packet_callback:
+                    self._producer_enabled = disposition == "approved"
+                    if self._producer_enabled and self._packet_callback:
                         client.set_packet_callback(self._packet_callback)
 
-                    logger.info("Reconnected on attempt %d", attempt)
+                    if disposition == "pending":
+                        logger.info(
+                            "Reconnected on attempt %d; producer approval pending",
+                            attempt,
+                        )
+                    else:
+                        logger.info("Reconnected on attempt %d", attempt)
                     return
                 except MaxAuthRequiredError as exc:
                     if client is not None:
@@ -255,6 +297,16 @@ class MaxConnection:
                 self._on_fatal_callback()
         finally:
             self._reconnecting = False
+
+    async def _reconnect_disposition(self) -> ReconnectDisposition:
+        callback = self._on_reconnect_authenticated_callback
+        if callback is None:
+            return "approved"
+        try:
+            return await callback()
+        except Exception:
+            logger.exception("Reconnect identity arbitration failed")
+            return "rejected"
 
     def _notify_auth_required(self, exc: Exception) -> None:
         if self._on_auth_required_callback is None:
