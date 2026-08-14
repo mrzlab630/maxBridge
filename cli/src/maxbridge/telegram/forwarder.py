@@ -1,7 +1,10 @@
 """Пересылка сообщений MAX → Telegram через Bot API."""
 
 import asyncio
+import hashlib
+import json
 import logging
+import time
 from pathlib import Path
 
 import aiohttp
@@ -25,6 +28,9 @@ _FILE_LIMIT = 50 * 1024 * 1024
 _MAX_CAPTION = 1024
 _MAX_TEXT = 4096
 _MAX_ALERT_BODY = 3800
+_COALESCE_WINDOW = 0.05
+_COALESCE_TTL = 10.0
+_COALESCE_MAX_ENTRIES = 512
 
 
 class TelegramLogHandler(logging.Handler):
@@ -61,6 +67,11 @@ class TelegramForwarder:
         self._observed_fingerprint: str | None = None
         self._reload_lock = asyncio.Lock()
         self._multi = len(account_manager.account_ids) > 1
+        self._coalescing_seen: dict[tuple[str, int, str, str, str], float] = {}
+        self._coalescing_pending: dict[
+            tuple[str, int, str, str, str], UnifiedMessage
+        ] = {}
+        self._coalescing_generation = 0
 
     async def start(self) -> None:
         self._loop = asyncio.get_running_loop()
@@ -73,6 +84,9 @@ class TelegramForwarder:
             self._loop = None
 
     async def _deactivate(self, *, close_http: bool = True) -> None:
+        self._coalescing_generation += 1
+        self._coalescing_pending.clear()
+        self._coalescing_seen.clear()
         if self._bus.has_subscriber(_SUB_ID):
             self._bus.unsubscribe(_SUB_ID)
         if close_http and self._http and not self._http.closed:
@@ -155,10 +169,28 @@ class TelegramForwarder:
         return handler
 
     async def _on_message(self, msg: UnifiedMessage) -> None:
-        if not self._config or not self._http:
+        if not self._config or not self._http or self._http.closed:
             return
         if msg.status == MessageStatus.DELETED:
             return
+
+        identity = self._message_identity(msg)
+        if identity is not None:
+            generation = self._coalescing_generation
+            if not self._claim_message(identity, msg):
+                return
+            try:
+                await asyncio.sleep(_COALESCE_WINDOW)
+                if (
+                    generation != self._coalescing_generation
+                    or not self._config
+                    or not self._http
+                    or self._http.closed
+                ):
+                    return
+                msg = self._coalescing_pending.get(identity, msg)
+            finally:
+                self._coalescing_pending.pop(identity, None)
 
         media_items = self._collect_media(msg)
 
@@ -175,6 +207,82 @@ class TelegramForwarder:
         # Fallback: текст
         text = self._format_full(msg)
         await self._send_text(text)
+
+    def _claim_message(
+        self,
+        identity: tuple[str, int, str, str, str],
+        msg: UnifiedMessage,
+    ) -> bool:
+        """Claim a message identity before any await and keep the cache bounded."""
+        now = time.monotonic()
+        self._prune_coalescing(now)
+        if identity in self._coalescing_seen:
+            previous = self._coalescing_pending.get(identity)
+            if (
+                previous is not None
+                and self._enrichment_score(msg) > self._enrichment_score(previous)
+            ):
+                self._coalescing_pending[identity] = msg
+            return False
+
+        if len(self._coalescing_seen) >= _COALESCE_MAX_ENTRIES:
+            oldest = next(iter(self._coalescing_seen))
+            self._coalescing_seen.pop(oldest, None)
+            self._coalescing_pending.pop(oldest, None)
+        self._coalescing_seen[identity] = now + _COALESCE_TTL
+        self._coalescing_pending[identity] = msg
+        return True
+
+    def _prune_coalescing(self, now: float | None = None) -> None:
+        now = time.monotonic() if now is None else now
+        expired = [key for key, deadline in self._coalescing_seen.items() if deadline <= now]
+        for key in expired:
+            self._coalescing_seen.pop(key, None)
+            self._coalescing_pending.pop(key, None)
+        while len(self._coalescing_seen) > _COALESCE_MAX_ENTRIES:
+            oldest = next(iter(self._coalescing_seen))
+            self._coalescing_seen.pop(oldest, None)
+            self._coalescing_pending.pop(oldest, None)
+
+    @staticmethod
+    def _message_identity(
+        msg: UnifiedMessage,
+    ) -> tuple[str, int, str, str, str] | None:
+        message_id = str(msg.message_id or "").strip()
+        if not message_id:
+            return None
+        content = {
+            "text": msg.text,
+            "attachments": msg.attachments,
+            "link_type": msg.link_type,
+            "link_chat_id": msg.link_chat_id,
+            "linked_message": (
+                msg.linked_message.to_dict() if msg.linked_message is not None else None
+            ),
+        }
+        encoded = json.dumps(
+            content,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+        digest = hashlib.sha256(encoded).hexdigest()
+        return (str(msg.account_id), msg.chat_id, message_id, msg.status.value, digest)
+
+    @staticmethod
+    def _enrichment_score(msg: UnifiedMessage) -> int:
+        """Prefer human-readable sender/chat metadata over protocol fallbacks."""
+        score = 0
+        sender_name = str(msg.sender_name or "").strip()
+        chat_name = str(msg.chat_name or "").strip()
+        if sender_name and sender_name != str(msg.sender_id or ""):
+            score += 1
+        if chat_name and chat_name != str(msg.chat_id):
+            score += 1
+        if str(msg.chat_type or "").strip():
+            score += 1
+        return score
 
     async def send_alert(self, text: str, title: str = "Ошибка maxBridge") -> bool:
         """Отправить системное уведомление в Telegram."""
